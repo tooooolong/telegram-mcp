@@ -1,9 +1,12 @@
 """Messages MCP tools."""
 
-import base64
+import hashlib
 import math
+import secrets
+from collections import OrderedDict
 
 from telegram_mcp.runtime import *
+from telegram_mcp.runtime import _effective_allowed_topics
 from telegram_mcp import transcription
 from telegram_mcp.keyboards import CALLBACK_KINDS, keyboard_of
 from telegram_mcp.audit import record_audit_event
@@ -367,7 +370,27 @@ def topics_metadata(topics: Dict[str, str]) -> Optional[Dict[str, Any]]:
     return {"topics": topics} if topics else None
 
 
-def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> dict:
+async def _self_account_id(cl) -> int:
+    # Telethon serves this from its self-entity cache after login.
+    me = await cl.get_me(input_peer=True)
+    if not isinstance(me, types.InputPeerUser) or me.user_id <= 0:
+        raise ValueError("Could not identify the current Telegram account.")
+    return me.user_id
+
+
+async def transcript_account_id(cl, messages) -> Optional[int]:
+    """Resolve the account once for a batch that can contain transcripts."""
+    if transcription.transcribe_mode() != "off" and any(
+        transcription.voice_media_id(msg) is not None and not getattr(msg, "message", None)
+        for msg in messages
+    ):
+        return await _self_account_id(cl)
+    return None
+
+
+def message_to_dict(
+    msg, chat_id: Optional[int] = None, forum: bool = False, *, account_id: Optional[int] = None
+) -> dict:
     """API-complete but compact Telethon message view (omit empty fields).
 
     The goal is for the MCP output to match the API object in completeness, rather
@@ -375,9 +398,7 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
     and so on. All these fields are already present in the message object returned
     by the same get_messages request.
 
-    chat_id (the numeric chat this message belongs to) enables voice/video-note
-    transcript enrichment via the cache - omit it to get the old text-only
-    behavior (used by existing tests with bare fake messages).
+    chat_id and account_id scope voice/video-note transcript enrichment.
 
     forum (the chat is a forum) adds "topic", the topic's id; the titles go once
     per response, see topics_for_messages.
@@ -435,7 +456,7 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
         }
 
     if not text:
-        voice_info = transcription.voice_attachment_info(msg, chat_id)
+        voice_info = transcription.voice_attachment_info(msg, chat_id, account_id=account_id)
         if voice_info is not None:
             if voice_info["duration"] is not None:
                 d["duration"] = voice_info["duration"]
@@ -565,11 +586,12 @@ def message_to_dict(msg, chat_id: Optional[int] = None, forum: bool = False) -> 
     return d
 
 
-def format_message_line(msg, chat_id: Optional[int] = None, forum: bool = False) -> str:
+def format_message_line(
+    msg, chat_id: Optional[int] = None, forum: bool = False, *, account_id: Optional[int] = None
+) -> str:
     """Single-line human-readable message representation with ALL key flags.
 
-    chat_id enables voice/video-note transcript enrichment via the cache -
-    see message_to_dict for why it's optional.
+    chat_id and account_id scope voice/video-note transcript enrichment.
     """
     parts = [f"ID: {msg.id}", get_sender_info(msg), f"Date: {msg.date}"]
 
@@ -632,7 +654,7 @@ def format_message_line(msg, chat_id: Optional[int] = None, forum: bool = False)
     if raw:
         safe_text = raw.replace("\n", "\\n")
     else:
-        voice_info = transcription.voice_attachment_info(msg, chat_id)
+        voice_info = transcription.voice_attachment_info(msg, chat_id, account_id=account_id)
         safe_text = transcription.render_voice_text(voice_info) if voice_info else "[empty]"
     return " | ".join(parts) + f" | Message: {safe_text}"
 
@@ -685,9 +707,15 @@ async def get_messages(
         if not messages:
             return "No messages found for this page."
         numeric_chat_id = get_marked_id(entity)
-        await transcription.prefetch_transcripts(cl, entity, numeric_chat_id, messages)
+        account_id = await transcript_account_id(cl, messages)
+        await transcription.prefetch_transcripts(
+            cl, entity, numeric_chat_id, messages, account_id=account_id
+        )
         forum = bool(getattr(entity, "forum", False))
-        lines = [format_message_line(msg, numeric_chat_id, forum) for msg in messages]
+        lines = [
+            format_message_line(msg, numeric_chat_id, forum, account_id=account_id)
+            for msg in messages
+        ]
         topics = await topics_for_messages(cl, entity, messages)
         if topics:
             lines.append("Topics: " + json.dumps(topics, ensure_ascii=False))
@@ -1678,10 +1706,15 @@ async def list_messages(
             return "No messages found matching the criteria."
 
         numeric_chat_id = get_marked_id(entity)
-        await transcription.prefetch_transcripts(cl, entity, numeric_chat_id, messages)
+        account_id = await transcript_account_id(cl, messages)
+        await transcription.prefetch_transcripts(
+            cl, entity, numeric_chat_id, messages, account_id=account_id
+        )
 
         forum = bool(getattr(entity, "forum", False))
-        records = [message_to_dict(msg, numeric_chat_id, forum) for msg in messages]
+        records = [
+            message_to_dict(msg, numeric_chat_id, forum, account_id=account_id) for msg in messages
+        ]
         topics = await topics_for_messages(cl, entity, messages)
         return format_tool_result(records, metadata=topics_metadata(topics))
     except Exception as e:
@@ -1718,11 +1751,9 @@ async def transcribe_voice(
     - "whisper": a local faster-whisper model on this server. Audio never
       leaves the machine; slower on CPU.
 
-    Results are cached per engine, by (chat_id, message_id, engine) - a
-    repeat call with the same engine returns the cached text without
-    hitting any engine again. Asking for an engine that has no cached
-    result transcribes with it, even when another engine's text is
-    already cached.
+    Results are cached for this account, recording and engine. A repeat call
+    verifies access to the current recording before returning cached text.
+    Asking for a new engine transcribes with it.
 
     The returned text is a machine transcript, not a verbatim quote: proper
     names, punctuation and occasional words drift under every engine.
@@ -1745,28 +1776,34 @@ async def transcribe_voice(
         entity = await resolve_entity(chat_id, cl)
         numeric_chat_id = get_marked_id(entity)
 
-        allowed_topics = get_allowed_topics(chat_id, entity)
-        if allowed_topics is not None:
-            # The transcript cache is keyed by message, not by topic, so the message is
-            # checked before the cache can answer for it.
-            topic_check = await cl.get_messages(entity, ids=message_id)
-            if not topic_check:
-                return f"Message {message_id} not found."
-            if not in_allowed_topics(topic_check, allowed_topics):
-                return topic_refusal(
-                    "transcribe_voice", chat_id, allowed_topics, f"Message {message_id}"
-                )
-
         chosen_engine = (engine or transcription.default_engine()).strip().lower()
         if chosen_engine not in transcription.ENGINES:
             accepted = ", ".join(f"'{name}'" for name in sorted(transcription.ENGINES))
             return f"Invalid engine '{engine}'. Use one of: {accepted}."
 
-        # Pinned to the chosen engine on purpose: a cached telegram transcript
-        # must not answer a request for any other engine. The native engine drops the last
-        # speech segment and the loss cannot be seen in the text.
+        msg = await cl.get_messages(entity, ids=message_id)
+        if (
+            not msg
+            or msg.id != message_id
+            or getattr(msg, "peer_id", None) is None
+            or utils.get_peer_id(msg.peer_id) != numeric_chat_id
+        ):
+            return f"Message {message_id} not found."
+        access_error = check_chat_access(chat_id, entity)
+        if access_error:
+            raise ChatAccessDeniedError(access_error)
+        allowed_topics = get_allowed_topics(chat_id, entity)
+        if not in_allowed_topics(msg, allowed_topics):
+            return topic_refusal(
+                "transcribe_voice", chat_id, allowed_topics, f"Message {message_id}"
+            )
+        media_id = transcription.voice_media_id(msg)
+        if media_id is None:
+            return f"Message {message_id} has no voice message or video note to transcribe."
+
+        account_id = await _self_account_id(cl)
         cached = transcription.get_cached_transcript(
-            numeric_chat_id, message_id, source=chosen_engine
+            account_id, numeric_chat_id, message_id, media_id, source=chosen_engine
         )
         if cached is not None:
             return json.dumps(
@@ -1782,21 +1819,19 @@ async def transcribe_voice(
                 default=json_serializer,
             )
 
-        msg = await cl.get_messages(entity, ids=message_id)
-        if not msg:
-            return f"Message {message_id} not found."
-        if not transcription.is_transcribable(msg):
-            return f"Message {message_id} has no voice message or video note to transcribe."
-
         config_error = transcription.engine_config_error(chosen_engine)
         if config_error:
             return config_error
 
         duration = transcription.voice_duration(msg)
-        # Cache-first and locked by (chat, message, engine): two concurrent
-        # calls for the same recording pay the engine once, not twice.
         result = await transcription.transcribe_cached(
-            cl, entity, msg, chosen_engine, numeric_chat_id, duration=duration
+            cl,
+            entity,
+            msg,
+            chosen_engine,
+            numeric_chat_id,
+            account_id=account_id,
+            duration=duration,
         )
 
         if result["status"] == "premium_required":
@@ -1903,8 +1938,9 @@ async def get_message_context(
         numeric_chat_id = get_marked_id(chat)
         records = []
         forum = bool(getattr(chat, "forum", False))
+        account_id = await transcript_account_id(cl, all_messages)
         for msg in all_messages:
-            record = message_to_dict(msg, numeric_chat_id, forum)
+            record = message_to_dict(msg, numeric_chat_id, forum, account_id=account_id)
             record["is_target"] = msg.id == message_id
 
             replied_id = message_reply_id(msg)
@@ -1912,7 +1948,11 @@ async def get_message_context(
                 try:
                     replied_msg = await cl.get_messages(chat, ids=replied_id)
                     if replied_msg and in_allowed_topics(replied_msg, allowed_topics):
-                        record["replied_message"] = message_to_dict(replied_msg, numeric_chat_id)
+                        if account_id is None:
+                            account_id = await transcript_account_id(cl, (replied_msg,))
+                        record["replied_message"] = message_to_dict(
+                            replied_msg, numeric_chat_id, account_id=account_id
+                        )
                 except Exception:
                     record["replied_message"] = None
 
@@ -2855,9 +2895,14 @@ async def search_messages(
             )
 
         numeric_chat_id = get_marked_id(entity)
-        await transcription.prefetch_transcripts(cl, entity, numeric_chat_id, messages)
+        account_id = await transcript_account_id(cl, messages)
+        await transcription.prefetch_transcripts(
+            cl, entity, numeric_chat_id, messages, account_id=account_id
+        )
         forum = bool(getattr(entity, "forum", False))
-        records = [message_to_dict(msg, numeric_chat_id, forum) for msg in messages]
+        records = [
+            message_to_dict(msg, numeric_chat_id, forum, account_id=account_id) for msg in messages
+        ]
         topics = await topics_for_messages(cl, entity, messages)
         return format_tool_result(records, metadata=topics_metadata(topics))
     except Exception as e:
@@ -2884,48 +2929,56 @@ class SearchOffset(NamedTuple):
         return (self.rate, peer, self.msg_id)
 
 
-def _encode_search_cursor(offset: SearchOffset, query: str, account: Optional[str]) -> str:
-    peer = offset.peer
-    if isinstance(peer, types.InputPeerUser):
-        peer_parts = ["user", peer.user_id, peer.access_hash]
-    elif isinstance(peer, types.InputPeerChannel):
-        peer_parts = ["channel", peer.channel_id, peer.access_hash]
-    elif isinstance(peer, types.InputPeerChat):
-        peer_parts = ["chat", peer.chat_id, 0]
-    else:
-        peer_parts = None
-    payload = {
-        "q": query,
-        "a": account or "",
-        "r": offset.rate,
-        "p": peer_parts,
-        "i": offset.msg_id,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii")
+SEARCH_CURSOR_TTL = 15 * 60
+SEARCH_CURSOR_LIMIT = 4096
+_INVALID_SEARCH_CURSOR = "Error: Search cursor is invalid or expired. Restart the search."
 
 
-def _decode_search_cursor(cursor: str, query: str, account: Optional[str]) -> SearchOffset:
-    """The offset a next_cursor stands for; it carries the peer's access hash, so it
-    works after a restart without the entity cache."""
-    try:
-        data = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
-        rate, msg_id, peer_parts = int(data["r"]), int(data["i"]), data["p"]
-        cursor_query, cursor_account = data["q"], data["a"]
-    except (ValueError, KeyError, TypeError) as e:
-        raise ValueError("cursor is not a next_cursor from search_global") from e
-    if cursor_query != query or cursor_account != (account or ""):
-        raise ValueError("cursor belongs to a different query or account")
-    if peer_parts is None:
-        peer = types.InputPeerEmpty()
-    else:
-        kind, peer_id, access_hash = peer_parts
-        peer = {
-            "user": lambda: types.InputPeerUser(int(peer_id), int(access_hash)),
-            "channel": lambda: types.InputPeerChannel(int(peer_id), int(access_hash)),
-            "chat": lambda: types.InputPeerChat(int(peer_id)),
-        }.get(kind, types.InputPeerEmpty)()
-    return SearchOffset(rate, peer, msg_id)
+class SearchCursor(NamedTuple):
+    offset: SearchOffset
+    account_id: int
+    query_hash: bytes
+    policy_hash: bytes
+    expires_at: float
+
+
+_search_cursors: OrderedDict[str, SearchCursor] = OrderedDict()
+_search_cursor_clock = time.monotonic
+
+
+def _search_policy_hash() -> bytes:
+    allowed = get_effective_allowed_chat_ids()
+    topics, whole = _effective_allowed_topics()
+    policy = (
+        None if allowed is None else sorted(allowed, key=str),
+        sorted(get_blocked_chat_ids(), key=str),
+        sorted(((key, sorted(ids)) for key, ids in topics.items()), key=lambda item: str(item[0])),
+        sorted(whole, key=str),
+    )
+    return hashlib.sha256(
+        json.dumps(policy, ensure_ascii=False, separators=(",", ":")).encode()
+    ).digest()
+
+
+def _prune_search_cursors(now: float) -> None:
+    while _search_cursors and next(iter(_search_cursors.values())).expires_at <= now:
+        _search_cursors.popitem(last=False)
+
+
+def _create_search_cursor(
+    offset: SearchOffset, account_id: int, query_hash: bytes, policy_hash: bytes
+) -> str:
+    now = _search_cursor_clock()
+    _prune_search_cursors(now)
+    if len(_search_cursors) >= SEARCH_CURSOR_LIMIT:
+        _search_cursors.popitem(last=False)
+    token = secrets.token_urlsafe(32)
+    while token in _search_cursors:
+        token = secrets.token_urlsafe(32)
+    _search_cursors[token] = SearchCursor(
+        offset, account_id, query_hash, policy_hash, now + SEARCH_CURSOR_TTL
+    )
+    return token
 
 
 async def _search_global_chunk(cl, query: str, offset: SearchOffset, limit: int):
@@ -2993,8 +3046,9 @@ async def search_global(
     Search for messages across all of the account's chats by text content.
 
     Results carry next_cursor and exhausted. To read further, pass next_cursor back
-    as cursor (keep page=1) until exhausted is true: each call is one request
-    however deep you go. page still works and returns the same page as before.
+    as cursor (keep page=1) until exhausted is true. Cursors last up to 15
+    minutes in this server process. If a cursor expires, start a new search.
+    Use page for numbered pages.
     page_size must be between 1 and 100. A page shortened by the chat allowlist is
     not the end of the results; only exhausted is.
 
@@ -3013,13 +3067,28 @@ async def search_global(
             )
         if cursor is not None and page != 1:
             raise ValueError("pass cursor with page=1")
-        offset = (
-            _decode_search_cursor(cursor, query, account)
-            if cursor is not None
-            else SearchOffset(0, types.InputPeerEmpty(), 0)
-        )
+        query_hash = hashlib.sha256(query.encode()).digest()
+        policy_hash = _search_policy_hash()
+        offset = SearchOffset(0, types.InputPeerEmpty(), 0)
+        state = None
+        if cursor is not None:
+            _prune_search_cursors(_search_cursor_clock())
+            state = _search_cursors.get(cursor)
+            if state is None or state.query_hash != query_hash or state.policy_hash != policy_hash:
+                return _INVALID_SEARCH_CURSOR
+
         cl = get_client(account)
         await ensure_connected(cl)
+        account_id = await _self_account_id(cl)
+        if state is not None:
+            if (
+                state.account_id != account_id
+                or state.expires_at <= _search_cursor_clock()
+                or _search_cursors.get(cursor) is not state
+                or _search_policy_hash() != policy_hash
+            ):
+                return _INVALID_SEARCH_CURSOR
+            offset = state.offset
 
         # messages.searchGlobal pages with a (rate, peer, id) cursor, not an offset, and
         # message ids repeat across chats, so a page is reached by walking the cursor.
@@ -3074,15 +3143,19 @@ async def search_global(
                 {
                     "chat_name": sanitize_name(chat_name),
                     "chat_id": chat_id,
-                    **message_to_dict(msg, chat_id),
+                    **message_to_dict(msg, chat_id, account_id=account_id),
                 }
             )
 
+        if _search_policy_hash() != policy_hash:
+            return _INVALID_SEARCH_CURSOR
         return format_tool_result(
             records,
             metadata={
                 "next_cursor": (
-                    None if exhausted else _encode_search_cursor(offset, query, account)
+                    None
+                    if exhausted
+                    else _create_search_cursor(offset, account_id, query_hash, policy_hash)
                 ),
                 "exhausted": exhausted,
             },
@@ -3157,9 +3230,14 @@ async def get_history(
         messages = keep_allowed_topics(messages, allowed_topics)
 
         numeric_chat_id = get_marked_id(entity)
-        await transcription.prefetch_transcripts(cl, entity, numeric_chat_id, messages)
+        account_id = await transcript_account_id(cl, messages)
+        await transcription.prefetch_transcripts(
+            cl, entity, numeric_chat_id, messages, account_id=account_id
+        )
         forum = bool(getattr(entity, "forum", False))
-        records = [message_to_dict(msg, numeric_chat_id, forum) for msg in messages]
+        records = [
+            message_to_dict(msg, numeric_chat_id, forum, account_id=account_id) for msg in messages
+        ]
         topics = await topics_for_messages(cl, entity, messages)
         return format_tool_result(records, metadata=topics_metadata(topics))
     except Exception as e:
@@ -4054,6 +4132,7 @@ async def export_unread_messages(
             exported_msgs: list = []
             collected = 0
 
+            account_id = None
             while unread_count:
                 batch = await cl.get_messages(
                     entity,
@@ -4063,8 +4142,10 @@ async def export_unread_messages(
                 if not batch:
                     break
 
+                if account_id is None:
+                    account_id = await transcript_account_id(cl, batch)
                 for msg in batch:
-                    record = message_to_dict(msg, int(numeric_id))
+                    record = message_to_dict(msg, int(numeric_id), account_id=account_id)
                     if include_media_metadata:
                         label = get_media_label(msg)
                         if label:
@@ -4221,6 +4302,7 @@ async def export_chat_history(
             offset_id = 0
             max_to_fetch = limit if limit is not None else float("inf")
 
+            account_id = None
             while collected < max_to_fetch:
                 batch_limit = int(min(100, max_to_fetch - collected))
                 fetch_kwargs = {"limit": batch_limit}
@@ -4233,8 +4315,10 @@ async def export_chat_history(
                 if not batch:
                     break
 
+                if account_id is None:
+                    account_id = await transcript_account_id(cl, batch)
                 for msg in batch:
-                    record = message_to_dict(msg, int(numeric_id))
+                    record = message_to_dict(msg, int(numeric_id), account_id=account_id)
                     if include_media_metadata:
                         label = get_media_label(msg)
                         if label:

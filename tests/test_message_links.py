@@ -123,6 +123,7 @@ def test_message_to_dict_and_line_include_links():
 @pytest.fixture
 def client(monkeypatch):
     cl = AsyncMock()
+    cl.get_me.return_value = types.InputPeerUser(1, 1)
     cl._mb_entity_cache = MagicMock()
     cl._mb_entity_cache.get.return_value = None
     monkeypatch.setattr(messages, "get_client", lambda account=None: cl)

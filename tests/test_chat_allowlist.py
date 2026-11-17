@@ -55,6 +55,10 @@ class FakeAllowlistClient:
         self._dialogs = dialogs or []
         self._messages = messages_list or []
 
+    async def get_me(self, *, input_peer):
+        assert input_peer
+        return types.InputPeerUser(51, 0)
+
     async def get_dialogs(self, *args, **kwargs):
         return list(self._dialogs)
 

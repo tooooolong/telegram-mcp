@@ -44,7 +44,7 @@ def get_server() -> Any:
 
 
 def get_http_app() -> Any:
-    """Return the Starlette ASGI application with protocol negotiation."""
+    """Return the authenticated ASGI application with protocol negotiation."""
     return create_streamable_http_app(mcp)
 
 

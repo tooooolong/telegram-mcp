@@ -1,6 +1,7 @@
-"""search_global walks Telegram's (rate, peer, id) cursor and hands it back as next_cursor."""
+"""search_global retains Telegram offsets behind opaque continuation tokens."""
 
 import json
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import pytest
@@ -33,11 +34,16 @@ def _results():
 class GlobalSearchServer(TelegramClient):
     """Answers messages.searchGlobal like Telegram: from the cursor, `limit` at a time."""
 
-    def __init__(self, results=None, response_type=types.messages.MessagesSlice):
+    def __init__(self, results=None, response_type=types.messages.MessagesSlice, account_id=51):
         super().__init__(StringSession(), 12345, "dummy_hash")
         self.results = _results() if results is None else results
         self.response_type = response_type
+        self.account_id = account_id
         self.requests = []
+
+    async def get_me(self, *, input_peer):
+        assert input_peer
+        return types.InputPeerUser(self.account_id, 0)
 
     def _position(self, request):
         if not request.offset_id:
@@ -79,6 +85,8 @@ def server(monkeypatch):
         return None
 
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHAT_IDS", raising=False)
+    monkeypatch.delenv("TELEGRAM_BLOCKED_CHAT_IDS", raising=False)
+    monkeypatch.setattr(messages, "_search_cursors", OrderedDict())
     monkeypatch.setattr(messages, "get_client", lambda account=None: client)
     monkeypatch.setattr(messages, "ensure_connected", connected)
     return client
@@ -132,10 +140,12 @@ async def test_pages_and_cursor_agree(server):
 
 @pytest.mark.asyncio
 async def test_cursor_needs_no_entity_cache(server, monkeypatch):
-    first = json.loads(await messages.search_global("отчёт", page=6, page_size=20))
-    fresh = GlobalSearchServer()  # a restarted server: empty session, empty cache
+    first = json.loads(await messages.search_global("отчёт", page=6, page_size=20, account="work"))
+    fresh = GlobalSearchServer()  # A replacement client for the same Telegram account.
     monkeypatch.setattr(messages, "get_client", lambda account=None: fresh)
-    second = await messages.search_global("отчёт", page_size=20, cursor=first["next_cursor"])
+    second = await messages.search_global(
+        "отчёт", page_size=20, cursor=first["next_cursor"], account="work-alias"
+    )
     after = server.results[120]  # page 6 of 20 ends with result 119
     assert ids(second)[0] == (messages.utils.get_peer_id(after.peer_id), after.id)
     peer = fresh.requests[0].offset_peer
@@ -194,12 +204,77 @@ async def test_allowlist_shortens_a_page_but_not_the_cursor(server, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_cursor_is_tied_to_its_query_and_account(server):
+async def test_cursor_is_tied_to_its_query_and_account(server, monkeypatch):
     first = json.loads(await messages.search_global("отчёт", page_size=10, account="work"))
-    for kwargs in ({"query": "другое", "account": "work"}, {"query": "отчёт", "account": "home"}):
-        result = await messages.search_global(cursor=first["next_cursor"], **kwargs)
-        assert "error" in result.lower()
+    result = await messages.search_global("другое", cursor=first["next_cursor"], account="work")
+    assert "error" in result.lower()
+
+    replacement = GlobalSearchServer(account_id=52)
+    monkeypatch.setattr(messages, "get_client", lambda account=None: replacement)
+    result = await messages.search_global("отчёт", cursor=first["next_cursor"], account="work")
+    assert "error" in result.lower()
+    assert replacement.requests == []
     assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env", "previous", "current"),
+    [
+        ("TELEGRAM_ALLOWED_CHAT_IDS", None, str(FRIEND.id)),
+        (
+            "TELEGRAM_ALLOWED_CHAT_IDS",
+            f"{messages.utils.get_peer_id(CHANNEL)}:2",
+            f"{messages.utils.get_peer_id(CHANNEL)}:3",
+        ),
+        ("TELEGRAM_BLOCKED_CHAT_IDS", None, str(FRIEND.id)),
+    ],
+)
+async def test_cursor_is_invalidated_by_privacy_policy_changes(
+    server, monkeypatch, env, previous, current
+):
+    if previous is not None:
+        monkeypatch.setenv(env, previous)
+    first = json.loads(await messages.search_global("отчёт", page_size=1))
+    monkeypatch.setenv(env, current)
+
+    result = await messages.search_global("отчёт", cursor=first["next_cursor"])
+
+    assert "restart the search" in result.lower()
+    assert len(server.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_cursor_tokens_are_random_and_expire(server, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(messages, "_search_cursor_clock", lambda: clock[0])
+    first = json.loads(await messages.search_global("отчёт", page_size=1))
+    repeat = json.loads(await messages.search_global("отчёт", page_size=1))
+    assert len(first["next_cursor"]) == len(repeat["next_cursor"]) == 43
+    assert first["next_cursor"] != repeat["next_cursor"]
+
+    clock[0] += messages.SEARCH_CURSOR_TTL
+    result = await messages.search_global("отчёт", cursor=first["next_cursor"])
+
+    assert "restart the search" in result.lower()
+    assert len(server.requests) == 2
+    assert not messages._search_cursors
+
+
+@pytest.mark.asyncio
+async def test_cursor_eviction_and_process_restart(server, monkeypatch):
+    monkeypatch.setattr(messages, "SEARCH_CURSOR_LIMIT", 1)
+    first = json.loads(await messages.search_global("отчёт", page_size=1))
+    second = json.loads(await messages.search_global("отчёт", page_size=1))
+
+    result = await messages.search_global("отчёт", cursor=first["next_cursor"])
+    assert "restart the search" in result.lower()
+    assert len(server.requests) == 2
+
+    messages._search_cursors.clear()
+    result = await messages.search_global("отчёт", cursor=second["next_cursor"])
+    assert "restart the search" in result.lower()
+    assert len(server.requests) == 2
 
 
 @pytest.mark.asyncio

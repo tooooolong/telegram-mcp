@@ -1,0 +1,14 @@
+.git
+.venv
+**/.env
+**/.env.*
+**/*.session
+**/*.session-*
+**/*.session.sql*
+**/*.log
+aliases.json
+incoming_feed.jsonl
+data/
+transcript_cache/
+downloads/
+uploads/

@@ -65,6 +65,7 @@ def _voice():
 @pytest.fixture
 def client(monkeypatch):
     cl = AsyncMock()
+    cl.get_me.return_value = types.InputPeerUser(101, 0)
     cl._mb_entity_cache = MagicMock()
     cl._mb_entity_cache.get.return_value = None
     monkeypatch.setattr(messages, "get_client", lambda account=None: cl)
@@ -148,7 +149,7 @@ async def test_context_keeps_target_marker(client):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool", ["search_global", "get_message_context"])
 async def test_cached_voice_transcript_is_part_of_the_record(client, transcript_cache_dir, tool):
-    transcription.save_transcript(MARKED_CHANNEL_ID, 1, "groq", "Hello there", duration=13)
+    transcription.save_transcript(101, MARKED_CHANNEL_ID, 1, 1, "groq", "Hello there", duration=13)
     voice = _voice()
     if tool == "search_global":
         client.return_value = SimpleNamespace(messages=[voice], users=[], chats=[])

@@ -137,7 +137,7 @@ Aliases live in `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/aliases.json` (o
 
 `TELEGRAM_TRANSCRIBE_LANGUAGE` (ISO-639-1, e.g. `nl`) is passed as a language hint to every engine except `telegram`; unset, the engines auto-detect. `TELEGRAM_TRANSCRIBE_TIMEOUT` (default 120 seconds) bounds a single request to the HTTP engines (`groq`, `openai`).
 
-The engine is chosen per call via the `engine` argument, or otherwise defaults to `TELEGRAM_TRANSCRIBE_ENGINE` (`groq`, `telegram`, `openai` or `whisper`). Results are cached by `(chat_id, message_id, engine)` in a local SQLite file so repeat reads and repeat listings never re-transcribe the same message. Concurrent requests for the same uncached recording are collapsed too: the second one waits for the first and returns its transcript, so a burst of callers costs one paid call, not one per caller. Every transcript is returned with a `note` marking it as a machine transcript, not a verbatim quote — treat it as a paraphrase, not exact wording.
+The engine defaults to `TELEGRAM_TRANSCRIBE_ENGINE` and can be overridden per call. The local SQLite cache keeps recordings separate by Telegram account, chat, message, media and engine. An explicit transcription request checks that the current account can still read the message before using the cache. Earlier entries written without an account ID are ignored. Concurrent requests for the same uncached recording share one transcription. Every transcript includes a note identifying it as a machine transcript.
 
 `get_history`, `get_messages`, `list_messages`, `search_messages`, `search_global`, and `get_message_context` fill in already-cached transcripts for voice messages instead of leaving the text empty, controlled by `TELEGRAM_TRANSCRIBE`:
 
@@ -281,10 +281,10 @@ Without a flag, the generator keeps the interactive method prompt.
 
 ### 3. Configure Environment
 
-Copy the example file and fill in your real values:
+For a new setup, create a private copy of the example file and fill in your real values.
 
 ```bash
-cp .env.example .env
+install -m 600 .env.example .env
 ```
 
 Single-account setup:
@@ -320,6 +320,8 @@ TELEGRAM_SESSION_NAME=/absolute/path/to/telegram_mcp_session
 
 The resulting `.session` file contains account credentials. Keep it private and
 do not commit it. The repository's `.gitignore` already excludes session files.
+The migrator creates the file privately and publishes it only after verification.
+Use a local destination filesystem that supports hard links.
 
 For a labeled account, use `--account` with the same label:
 
@@ -558,6 +560,12 @@ For `http` and `sse`, the server binds `MCP_HOST`:`MCP_PORT` (default
 `127.0.0.1:8765`); the streamable HTTP endpoint is `/mcp`, the SSE endpoint is
 `/sse`.
 
+Both network transports require `MCP_AUTH_TOKEN` in the server environment and
+`Authorization: Bearer <token>` on every MCP request. Use a strong random token
+and give it only to clients you trust with the configured Telegram sessions.
+Use an HTTPS reverse proxy when clients connect from another machine. The stdio
+transport needs no bearer token.
+
 Host and Origin validation is always on for `http` and `sse`, so a web page
 open in your browser cannot send tool calls to the local server (cross-origin
 request forgery / DNS rebinding). By default only `127.0.0.1`, `localhost` and
@@ -583,28 +591,20 @@ that completion is unknown: a write may already have succeeded, so check the
 destination before retrying. Set the value to `0` only for a deliberately
 unbounded operator session.
 
-Register the shared server with clients:
+Give each client process the same `MCP_AUTH_TOKEN` and register the shared
+server.
 
 ```bash
 # Claude Code
-claude mcp add --transport http telegram http://127.0.0.1:8765/mcp
+claude mcp add --transport http telegram http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer ${MCP_AUTH_TOKEN}"
 
 # Codex
-codex mcp add telegram --url http://127.0.0.1:8765/mcp
+codex mcp add telegram --url http://127.0.0.1:8765/mcp \
+  --bearer-token-env-var MCP_AUTH_TOKEN
 ```
 
-For stdio-only clients, bridge with [mcp-remote](https://www.npmjs.com/package/mcp-remote):
-
-```json
-{
-  "mcpServers": {
-    "telegram-mcp": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
-    }
-  }
-}
-```
+For clients that cannot send HTTP headers, use the stdio configuration.
 
 ## Multi-Account Setup
 
@@ -664,7 +664,13 @@ Before connecting, every server process takes a per-session lock (see the
 `AuthKeyDuplicatedError` entry under Troubleshooting). By default it is
 exclusive: a second instance for the same session waits briefly for the first
 to exit and otherwise refuses to start. That lock can only see processes on the
-same host, and Telegram's rule is about IPs, not processes: instances on one
+same host under the same OS user. The server keeps the locks in
+`.telegram-mcp-locks` under that user's profile. Stop older instances before
+upgrading from a version that used the shared temporary directory.
+
+On Windows, private session directories require an up-to-date CPython release
+that supports private directory ACLs with `os.mkdir` mode `0o700`.
+Telegram's rule is about IPs, not processes: instances on one
 host only collide when they reach Telegram from different IPs (dual-stack or
 split-tunnel VPN hosts). When they all share one egress IP — a laptop running
 several MCP clients — you can let them share the session instead of pooling:
@@ -754,7 +760,14 @@ bypassing the proxy.
 
 ## File Path Security
 
-File-path and media tools (`send_file`, `edit_message_media`, `download_media`, `upload_file`, `send_voice`, `send_sticker`, `set_profile_photo`, `edit_chat_photo`, and `send_album`) are registered and supported, but remain strictly disabled by default until allowed roots are configured (safe-by-default to prevent unauthorized file access).
+File-path and media tools (`send_file`, `edit_message_media`, `download_media`, `upload_file`, `send_voice`, `send_sticker`, `set_profile_photo`, `edit_chat_photo`, `send_album`, and `save_photo`) require allowed roots.
+
+`open_photo` returns the image to the client. Use `save_photo` for an explicit
+local copy under an allowed root. Saving to an existing file is refused.
+
+`inspect_document` accepts attachments up to 5 MiB and returns up to 20,000
+characters from the document. On Linux, PDF preview examines up to 20 pages in
+a time- and memory-limited subprocess. Other hosts can preview text and images.
 
 `send_file` and `send_album` keep their existing success line and append `MessageIDs: [...]` when Telethon returns the sent messages. Album IDs follow the same order as `file_paths`; a `null` entry means Telethon could not map that position to a message ID. Pass a known ID to `edit_message_media` to replace that item.
 
@@ -803,6 +816,7 @@ proxy) and configure a server allowed root:
   `send_voice` or `send_sticker`.
 
 Both URLs carry an HMAC signature and stay inside the first server allowed root.
+The signature authorizes the individual transfer without an MCP bearer header.
 Each expires after an hour or when the server restarts, and an upload URL takes
 one upload. Uploads land in `<first_root>/uploads/` and are deleted two hours
 later. Client MCP Roots name the client's own disk, so such a deployment
@@ -863,6 +877,7 @@ When `TELEGRAM_ALLOWED_CHAT_IDS` is set:
 - **Search, Drafts & Calls (`search_global`, `get_drafts`, `list_calls`):** Global searches, draft listings and the call list omit unallowed conversations.
 - **Contact, folder & group-admin tools:** a chat named by `contact_id` or `group_id` (`get_last_interaction`, `get_contact_chats`, `invite_to_group`, `promote_admin`, `demote_admin`) is checked like `chat_id`; `get_common_chats`, `get_contact_chats`, `get_direct_chat_by_contact` and `get_folder` leave unallowed chats out of their results; `create_folder` refuses unallowed `chat_ids`.
 - **Incoming Events:** Notifications and debounce feeds only process events from allowed chats.
+- **Invite links:** `join_chat_by_link` and `import_chat_invite` require Telegram to identify an allowed whole chat before joining. Some invite previews omit the chat ID, so those links are refused while the allowlist is enabled.
 
 If `TELEGRAM_ALLOWED_CHAT_IDS` is unset or empty, the server operates in unrestricted mode (default), preserving 100% backward compatibility.
 
@@ -876,7 +891,7 @@ TELEGRAM_ALLOWED_CHAT_IDS=-100123456789:163,12345678
 ```
 
 For a chat limited to topics:
-- **Reading tools that keep to the topics:** `get_history` (the allowed topic is the default when there is only one), `list_messages`, `get_messages`, `search_messages`, `get_message_context`, `get_messages_after`, `list_topics` (only the allowed topics), `get_chat` (`last_message` only from an allowed topic), `open_photo`, `inspect_document`, `get_media_info`, `transcribe_voice` and `wait_for_events`. Messages of other topics are left out, and a message id from another topic is refused. `get_messages_after` also returns `next_after_id`, the newest message it read, so a reader can continue past messages it left out.
+- **Tools that keep to the topics:** `get_history` (the allowed topic is the default when there is only one), `list_messages`, `get_messages`, `search_messages`, `get_message_context`, `get_messages_after`, `list_topics` (only the allowed topics), `get_chat` (`last_message` only from an allowed topic), `open_photo`, `save_photo`, `inspect_document`, `get_media_info`, `transcribe_voice` and `wait_for_events`. Messages of other topics are left out, and a message id from another topic is refused. `get_messages_after` also returns `next_after_id`, the newest message it read, so a reader can continue past messages it left out.
 - **Every other tool that takes the chat** (sending, editing, pinned and scheduled messages, members, the admin log, exports, …) is refused with `Access to chat '<chat_id>' is restricted by privacy policy (TELEGRAM_ALLOWED_CHAT_IDS): only forum topic(s) <ids> are allowed, and <tool> cannot be limited to a topic.` A tool has to be taught about topics before it can be used, so a tool that does not know about them never reaches the rest of the chat.
 - **Tools that read many chats:** `search_global`, `get_drafts` and the incoming event log leave out the chat's other topics.
 - Chat-level metadata stays visible: the title, the member count and the chat's total unread count.
@@ -902,8 +917,9 @@ Prefer numeric IDs for reliable blocking: usernames can change, and chats whose
 username cannot be checked may still appear in results. Existing export files are
 not filtered retroactively. Complete folder snapshots remain unavailable when a
 blocklist is active because they contain unfiltered chat identifiers.
-Global-search cursors keep Telegram's original Base64-encoded offsets and may
-contain a blocked chat's ID and access hash, but not message text.
+Global-search cursors are opaque tokens valid for the same query, account and
+chat policy for up to 15 minutes. Start from the first page after a server
+restart, policy change, or cursor expiry or eviction.
 
 ## Deletion Audit Log (Recent Actions for Private Chats)
 
@@ -935,8 +951,8 @@ docker build -t telegram-mcp:latest .
 
 ### Shared server (recommended)
 
-Run one long-lived container serving streamable HTTP, and point every MCP
-client at it (see [Transports](#transports) for client registration):
+Set `MCP_AUTH_TOKEN` in `.env`, then run one long-lived container serving
+streamable HTTP. See [Transports](#transports) for client registration.
 
 ```bash
 docker run -d --name telegram-mcp --restart unless-stopped \
@@ -948,9 +964,7 @@ docker run -d --name telegram-mcp --restart unless-stopped \
 ```
 
 `MCP_HOST=0.0.0.0` binds inside the container so the published port works;
-`-p 127.0.0.1:8765:8765` keeps the server reachable only from the local
-machine — the endpoint is unauthenticated, so never publish it on a public
-interface.
+`-p 127.0.0.1:8765:8765` publishes the port on the host's loopback interface.
 
 The bundled Compose file runs the same setup:
 

@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
       target: production
     container_name: telegram-mcp
-    # Load environment variables from a .env file in the same directory
+    # Include MCP_AUTH_TOKEN in .env for the shared HTTP service.
     env_file:
       - .env
     # Serve streamable HTTP so one long-lived container is shared by all MCP
@@ -16,7 +16,7 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_HOST: 0.0.0.0
-    # The endpoint is unauthenticated — publish on localhost only.
+    # Publish the authenticated endpoint on localhost.
     ports:
       - "127.0.0.1:8765:8765"
     # Optional: Uncomment the following lines to mount a local directory

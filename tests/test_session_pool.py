@@ -3,8 +3,8 @@ import os
 
 import pytest
 
-from telegram_mcp import runner, runtime
-from telegram_mcp.singleton import try_lock_exclusive
+from telegram_mcp import runner, runtime, singleton
+from telegram_mcp.singleton import SessionLockError, session_lock_directory, try_lock_exclusive
 
 # --- _parse_session_pool -----------------------------------------------------
 
@@ -24,17 +24,25 @@ def test_parse_session_pool_empty_when_unset(monkeypatch):
 
 @pytest.fixture
 def isolated_lock_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(runtime.tempfile, "gettempdir", lambda: str(tmp_path))
-    monkeypatch.setattr(runtime, "_SESSION_LOCKS", [])
-    return tmp_path
+    path = tmp_path / "locks"
+    handles = []
+    monkeypatch.setattr(runtime, "session_lock_directory", lambda: session_lock_directory(path))
+    monkeypatch.setattr(runtime, "_SESSION_LOCKS", handles)
+    yield path
+    for handle in handles:
+        handle.close()
+
+
+def _slot_path(lock_dir, session):
+    digest = hashlib.sha1(session.encode("utf-8")).hexdigest()[:16]
+    return lock_dir / f"pool-session-{digest}.lock"
 
 
 def _lock_slot(lock_dir, session):
     """Simulate another live client holding the slot for ``session``."""
-    digest = hashlib.sha1(session.encode("utf-8")).hexdigest()[:16]
-    path = os.path.join(str(lock_dir), "telegram-mcp-session-locks", f"session-{digest}.lock")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fh = open(path, "a+")
+    path = _slot_path(session_lock_directory(lock_dir), session)
+    path.touch(mode=0o600)
+    fh = path.open("r+")
     assert try_lock_exclusive(fh), "test could not take the lock it means to hold"
     return fh
 
@@ -70,12 +78,18 @@ def test_acquire_session_locks_are_visible_to_other_clients(isolated_lock_dir):
     pool[0], which is precisely the collision the pool exists to prevent.
     """
     assert runtime._acquire_session(["AAA", "BBB"]) == "AAA"
-    digest = hashlib.sha1(b"AAA").hexdigest()[:16]
-    path = os.path.join(
-        str(isolated_lock_dir), "telegram-mcp-session-locks", f"session-{digest}.lock"
-    )
-    with open(path, "a+") as rival:
+    with _slot_path(isolated_lock_dir, "AAA").open("r+") as rival:
         assert not try_lock_exclusive(rival)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions only")
+def test_pool_fails_closed_when_private_directory_is_unavailable(isolated_lock_dir):
+    isolated_lock_dir.mkdir(mode=0o755)
+    try:
+        with pytest.raises(SessionLockError, match="Cannot use session lock directory"):
+            runtime._acquire_session(["AAA", "BBB"])
+    finally:
+        assert list(isolated_lock_dir.iterdir()) == []
 
 
 # --- _discover_accounts prefers the pool for the default account -------------
@@ -125,11 +139,16 @@ class _FlakyClient:
 
 
 @pytest.fixture
-def no_sleep(monkeypatch):
+def no_sleep(monkeypatch, tmp_path):
     async def _noop(_delay):
         return None
 
     monkeypatch.setattr(runner.asyncio, "sleep", _noop)
+    monkeypatch.setattr(singleton, "_account_home", lambda: tmp_path)
+    yield
+    lock = runner._session_locks.pop("default", None)
+    if lock is not None:
+        lock.release()
 
 
 @pytest.mark.asyncio

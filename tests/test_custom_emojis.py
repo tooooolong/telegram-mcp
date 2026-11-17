@@ -164,6 +164,7 @@ def test_rich_content_without_custom_emoji_has_no_metadata():
 @pytest.fixture
 def client(monkeypatch):
     cl = AsyncMock()
+    cl.get_me.return_value = types.InputPeerUser(1, 1)
     cl._mb_entity_cache = MagicMock()
     cl._mb_entity_cache.get.return_value = None
     cl.get_messages.return_value = [_message()]

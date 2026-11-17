@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       target: production
     container_name: telegram-mcp-shared
+    # Include MCP_AUTH_TOKEN in this file for the shared HTTP service.
     env_file:
       - ../../.env
     environment:

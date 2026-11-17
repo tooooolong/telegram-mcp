@@ -8,7 +8,7 @@ Depending on your client setup and workload, choose one of two deployment archit
 
 | Mode | Transport | Best For | Pros | Considerations |
 | :--- | :--- | :--- | :--- | :--- |
-| **Shared Server** *(Recommended)* | Streamable HTTP (`MCP_TRANSPORT=http`) | Multiple clients, subagent teams, persistent servers | Single long-lived connection, avoids Telegram session rate-limits, shared transcript cache | Binds to localhost only (unauthenticated HTTP) |
+| **Shared Server** *(Recommended)* | Streamable HTTP (`MCP_TRANSPORT=http`) | Multiple clients, subagent teams, persistent servers | Single long-lived connection, avoids Telegram session rate-limits, shared transcript cache | Publishes on localhost and requires a bearer token |
 | **Per-Client Stdio** | Stdio (`MCP_TRANSPORT=stdio`) | Single CLI tool, isolated one-shot execution | Isolated ephemeral container lifecycle | Spawns a container per client session; not recommended for multi-agent suites |
 
 ---
@@ -19,8 +19,8 @@ Depending on your client setup and workload, choose one of two deployment archit
 
 1. Prepare your `.env` file with credentials:
    ```bash
-   cp .env.example .env
-   # Set TELEGRAM_API_ID, TELEGRAM_API_HASH, and TELEGRAM_SESSION_STRING
+   install -m 600 .env.example .env
+   # Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING, and MCP_AUTH_TOKEN
    ```
 
 2. Ensure the transcript cache directory exists and has correct ownership for the non-root `appuser` (UID 1000):
@@ -38,24 +38,19 @@ The server binds to `127.0.0.1:8765`.
 
 ### Client Configurations
 
-#### Claude Desktop (`claude_desktop_config.json`)
-```json
-{
-  "mcpServers": {
-    "telegram": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sse", "http://127.0.0.1:8765/sse"]
-    }
-  }
-}
-```
+Set `MCP_AUTH_TOKEN` in the client's environment to the same token used by the
+server. See the [client commands](../../README.md#transports) for Claude Code and
+Codex. Use [per-client stdio](#2-per-client-stdio-mode) for Claude Desktop.
 
 #### Cursor (`.cursor/mcp.json`)
 ```json
 {
   "mcpServers": {
     "telegram": {
-      "url": "http://127.0.0.1:8765/sse"
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:MCP_AUTH_TOKEN}"
+      }
     }
   }
 }
@@ -103,6 +98,6 @@ Tools accept the `account` parameter (e.g. `send_message(..., account="work")`).
 
 ## 4. Troubleshooting & Operational Notes
 
-- **Port Binding:** Always bind the HTTP port to `127.0.0.1` (`-p 127.0.0.1:8765:8765`). The MCP HTTP endpoint is designed for local machine IPC and does not include authentication.
+- **Port Binding:** Publish the HTTP port on `127.0.0.1` (`-p 127.0.0.1:8765:8765`). The MCP endpoint requires the shared bearer token.
 - **Cache Persistence:** Mounting `/app/data/transcripts` persists SQLite voice-transcription caches across container rebuilds.
 - **Permission Denied:** If the container logs show permission errors on `/app/data`, verify that `./transcript_cache` on the host is writable by UID 1000.

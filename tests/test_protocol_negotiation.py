@@ -1,11 +1,15 @@
 """Tests for MCP 2026-07-28 protocol negotiation, backward compatibility, and discovery."""
 
+import asyncio
+
 import pytest
+from starlette.responses import PlainTextResponse
 from starlette.testclient import TestClient
 
 from telegram_mcp.transport import (
     DEFAULT_PROTOCOL_VERSION,
     LATEST_PROTOCOL_VERSION,
+    TelegramFastMCP,
     SUPPORTED_PROTOCOL_VERSIONS,
     UnsupportedProtocolVersionError,
     create_streamable_http_app,
@@ -15,6 +19,121 @@ from telegram_mcp.transport import (
 )
 from telegram_mcp.runtime import mcp
 import telegram_mcp.server as server
+
+_TEST_TOKEN = "test-operator-token"
+_AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+
+
+@pytest.fixture(autouse=True)
+def _configure_auth(monkeypatch):
+    monkeypatch.setenv("MCP_AUTH_TOKEN", _TEST_TOKEN)
+
+
+@pytest.mark.parametrize(
+    "app_factory",
+    [server.get_http_app, mcp.streamable_http_app, mcp.sse_app],
+)
+@pytest.mark.parametrize("token", [None, "", "   ", "invalid token"])
+def test_mcp_network_apps_require_valid_token_configuration(monkeypatch, app_factory, token):
+    if token is None:
+        monkeypatch.delenv("MCP_AUTH_TOKEN")
+    else:
+        monkeypatch.setenv("MCP_AUTH_TOKEN", token)
+
+    with pytest.raises(RuntimeError, match="MCP_AUTH_TOKEN"):
+        app_factory()
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        {},
+        {"Authorization": "Basic test-operator-token"},
+        {"Authorization": "Bearer wrong-token"},
+        [("Authorization", "Bearer test-operator-token"), ("Authorization", "Bearer wrong-token")],
+    ],
+)
+def test_http_rejects_unauthorized_discovery_and_mcp_requests(authorization):
+    with TestClient(server.get_http_app(), base_url="http://localhost:8765") as client:
+        get = client.get("/mcp", headers=authorization)
+        post = client.post("/mcp", headers=authorization, json=_TOOLS_LIST)
+        assert get.status_code == post.status_code == 401
+        assert get.headers["www-authenticate"] == "Bearer"
+
+
+def test_http_custom_routes_require_auth_even_with_media_prefix():
+    instance = TelegramFastMCP("test")
+
+    @instance.custom_route("/media/status", methods=["GET"])
+    async def status(request):
+        return PlainTextResponse("ready")
+
+    with TestClient(instance.streamable_http_app(), base_url="http://localhost:8765") as client:
+        assert client.get("/media/status").status_code == 401
+        assert client.get("/media/status", headers=_AUTH_HEADERS).text == "ready"
+
+
+def test_sse_requires_bearer_auth_for_both_endpoints():
+    with TestClient(mcp.sse_app(), base_url="http://localhost:8765") as client:
+        assert client.get("/sse").status_code == 401
+        assert client.post("/messages/", json=_TOOLS_LIST).status_code == 401
+        response = client.post("/messages/", headers=_AUTH_HEADERS, json=_TOOLS_LIST)
+        assert response.status_code == 400
+        assert "session_id" in response.text
+
+
+@pytest.mark.parametrize("factory", ["streamable_http_app", "sse_app"])
+def test_authorized_browser_can_read_from_allowed_origin(monkeypatch, factory):
+    monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://client.example.com")
+    instance = TelegramFastMCP("test")
+
+    @instance.custom_route("/status", methods=["GET"])
+    async def status(request):
+        return PlainTextResponse("ready", headers={"Vary": "Accept"})
+
+    app = getattr(instance, factory)()
+    headers = {**_AUTH_HEADERS, "Origin": "https://client.example.com"}
+    with TestClient(app, base_url="http://localhost:8765") as client:
+        response = client.get("/status", headers=headers)
+
+    assert response.text == "ready"
+    assert response.headers["access-control-allow-origin"] == "https://client.example.com"
+    assert response.headers["vary"] == "Accept, Origin"
+
+
+@pytest.mark.asyncio
+async def test_sse_authorized_client_receives_message_endpoint():
+    app = mcp.sse_app()
+    endpoint_sent = asyncio.Event()
+    response = []
+
+    async def receive():
+        await endpoint_sent.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        response.append(message)
+        if b"event: endpoint" in message.get("body", b""):
+            endpoint_sent.set()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/sse",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"localhost:8765"),
+            (b"authorization", f"Bearer {_TEST_TOKEN}".encode()),
+        ],
+    }
+    await asyncio.wait_for(app(scope, receive, send), timeout=2)
+
+    assert response[0]["status"] == 200
+    assert any(b"data: /messages/?session_id=" in m.get("body", b"") for m in response)
 
 
 def test_supported_protocol_versions():
@@ -77,7 +196,7 @@ def test_server_module_exports():
 def test_http_transport_negotiation_2026_07_28():
     """Verify clients requesting 2026-07-28 negotiate 2026-07-28 successfully over HTTP."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.post(
             "/mcp",
             headers={
@@ -104,7 +223,7 @@ def test_http_transport_negotiation_2026_07_28():
 def test_http_transport_backwards_compatibility_2025_11_25():
     """Verify older clients requesting 2025-11-25 negotiate 2025-11-25 over HTTP."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.post(
             "/mcp",
             headers={
@@ -131,7 +250,7 @@ def test_http_transport_backwards_compatibility_2025_11_25():
 def test_http_transport_backwards_compatibility_2024_11_05():
     """Verify legacy clients requesting 2024-11-05 negotiate 2024-11-05 over HTTP."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.post(
             "/mcp",
             headers={
@@ -158,7 +277,7 @@ def test_http_transport_backwards_compatibility_2024_11_05():
 def test_http_transport_unsupported_protocol_rejected():
     """Verify unsupported protocol versions receive HTTP 400 with supported versions list."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.post(
             "/mcp",
             headers={
@@ -183,7 +302,7 @@ def test_http_transport_unsupported_protocol_rejected():
 def test_http_transport_options_preflight():
     """Verify OPTIONS preflight returns 204 with protocol and CORS headers."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.options("/mcp", headers={"MCP-Protocol-Version": "2026-07-28"})
         assert response.status_code == 204
         assert response.headers.get("mcp-protocol-version") == "2026-07-28"
@@ -213,7 +332,7 @@ _POST_HEADERS = {
 def test_http_transport_rejects_cross_origin_requests(method, path):
     """CWE-942 (#378): a web page on another origin must not reach the server at all."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         headers = dict(_POST_HEADERS, Origin="https://evil.example")
         kwargs = {"json": _TOOLS_LIST} if method == "POST" else {}
         response = client.request(method, path, headers=headers, **kwargs)
@@ -226,14 +345,14 @@ def test_http_transport_rejects_cross_origin_requests(method, path):
 )
 def test_http_transport_rejects_lookalike_origins(origin):
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.options("/mcp", headers={"Origin": origin})
         assert response.status_code == 403
 
 
 def test_http_transport_preflight_echoes_only_allowed_origin():
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.options("/mcp", headers={"Origin": "http://localhost:6274"})
         assert response.status_code == 204
         assert response.headers.get("access-control-allow-origin") == "http://localhost:6274"
@@ -243,23 +362,14 @@ def test_http_transport_preflight_echoes_only_allowed_origin():
 def test_http_transport_allows_requests_without_origin():
     """Non-browser MCP clients send no Origin header and keep working."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.post("/mcp", headers=_POST_HEADERS, json=_TOOLS_LIST)
         assert response.status_code == 200
 
 
 def test_http_transport_honours_configured_allowed_origins(monkeypatch):
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    monkeypatch.setattr(
-        mcp.settings,
-        "transport_security",
-        TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=["mcp.example.com"],
-            allowed_origins=["https://app.example.com"],
-        ),
-    )
+    monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mcp.example.com")
+    monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://app.example.com")
     app = create_streamable_http_app(mcp)
     with TestClient(app, base_url="http://mcp.example.com") as client:
         ok = client.options("/mcp", headers={"Origin": "https://app.example.com"})
@@ -273,7 +383,7 @@ def test_http_transport_honours_configured_allowed_origins(monkeypatch):
 def test_http_transport_discovery_get_probe():
     """Verify plain GET discovery probe returns JSON server metadata."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.get(
             "/mcp",
             headers={
@@ -292,7 +402,7 @@ def test_http_transport_discovery_get_probe():
 def test_http_transport_modern_stateless_tools_list():
     """Verify modern 2026-07-28 stateless call to tools/list executes cleanly."""
     app = create_streamable_http_app(mcp)
-    with TestClient(app, base_url="http://localhost:8765") as client:
+    with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
         response = client.post(
             "/mcp",
             headers={

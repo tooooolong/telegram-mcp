@@ -129,6 +129,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -201,3 +203,5 @@ sticker.webp
 two.png
 aliases.json
 incoming_feed.jsonl
+data/transcripts/
+transcript_cache/

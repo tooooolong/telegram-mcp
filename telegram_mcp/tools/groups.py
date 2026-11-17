@@ -1653,6 +1653,58 @@ async def get_invite_link(chat_id: Union[int, str], account: Optional[str] = Non
         return log_and_format_error("get_invite_link", e, chat_id=chat_id)
 
 
+async def _join_chat_invite(invite_hash: str, account: Optional[str], tool_name: str) -> str:
+    try:
+        cl = get_client(account)
+        await ensure_connected(cl)
+        preview = await cl(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+        identified = isinstance(preview, (types.ChatInviteAlready, types.ChatInvitePeek))
+        chat = preview.chat if identified else None
+        if is_chat_allowlist_enabled():
+            if chat is None:
+                return (
+                    "Telegram did not identify the invite's chat. Cannot join while "
+                    "TELEGRAM_ALLOWED_CHAT_IDS is enabled."
+                )
+            if error := check_chat_access("invite target", chat, topic_restricted_tool=tool_name):
+                return error
+
+        if isinstance(preview, types.ChatInviteAlready):
+            if is_chat_blocked(None, chat):
+                return "Already a member of this chat."
+            title = sanitize_name(getattr(chat, "title", "Unknown Chat"))
+            return f"You are already a member of this chat: {title}"
+
+        result = await cl(functions.messages.ImportChatInviteRequest(hash=invite_hash))
+        chats = getattr(result, "chats", ())
+        if chat is None:
+            joined = next(iter(chats), None)
+        else:
+            target_id = get_marked_id(chat)
+            joined = next(
+                (candidate for candidate in chats if get_marked_id(candidate) == target_id), None
+            )
+        if joined is not None and not is_chat_blocked(None, joined):
+            if check_chat_access("invite target", joined, topic_restricted_tool=tool_name) is None:
+                title = sanitize_name(getattr(joined, "title", "Unknown Chat"))
+                return f"Successfully joined chat: {title}"
+        return "Joined chat via invite hash."
+    except telethon.errors.InviteHashExpiredError:
+        return "The invite hash has expired and is no longer valid."
+    except (telethon.errors.InviteHashInvalidError, telethon.errors.InviteHashEmptyError):
+        return "The invite hash is invalid or malformed."
+    except telethon.errors.UserAlreadyParticipantError:
+        return "You are already a member of this chat."
+    except telethon.errors.InviteRequestSentError:
+        return "Join request sent. Membership requires approval."
+    except telethon.errors.ChatAdminRequiredError:
+        return "Cannot join this chat - requires admin approval."
+    except telethon.errors.UsersTooMuchError:
+        return "Cannot join this chat - it has reached maximum number of participants."
+    except Exception as e:
+        return log_and_format_error(tool_name, e)
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Join Chat By Link", openWorldHint=True, destructiveHint=True, idempotentHint=True
@@ -1661,52 +1713,9 @@ async def get_invite_link(chat_id: Union[int, str], account: Optional[str] = Non
 @with_account(readonly=False)
 @flood_category("channel_lifecycle")
 async def join_chat_by_link(link: str, account: Optional[str] = None) -> str:
-    """
-    Join a chat by invite link.
-    """
-    try:
-        cl = get_client(account)
-        await ensure_connected(cl)
-        # Extract the hash from the invite link
-        if "/" in link:
-            hash_part = link.split("/")[-1]
-            if hash_part.startswith("+"):
-                hash_part = hash_part[1:]  # Remove the '+' if present
-        else:
-            hash_part = link
-
-        # Try checking the invite before joining
-        invite_info = None
-        try:
-            # Try to check invite info first (will often fail if not a member)
-            invite_info = await cl(functions.messages.CheckChatInviteRequest(hash=hash_part))
-        except Exception:
-            # This often fails if not a member - just continue
-            pass
-
-        if getattr(invite_info, "chat", None):
-            if is_chat_blocked(get_marked_id(invite_info.chat), invite_info.chat):
-                return "Already a member of this chat."
-            chat_title = sanitize_name(getattr(invite_info.chat, "title", "Unknown Chat"))
-            return f"You are already a member of this chat: {chat_title}"
-
-        # Join the chat using the hash
-        result = await cl(functions.messages.ImportChatInviteRequest(hash=hash_part))
-        if result and hasattr(result, "chats") and result.chats:
-            if is_chat_blocked(get_marked_id(result.chats[0]), result.chats[0]):
-                return "Joined chat via invite hash."
-            chat_title = sanitize_name(getattr(result.chats[0], "title", "Unknown Chat"))
-            return f"Successfully joined chat: {chat_title}"
-        return "Joined chat via invite hash."
-    except Exception as e:
-        err_str = str(e).lower()
-        if "expired" in err_str:
-            return "The invite hash has expired and is no longer valid."
-        elif "invalid" in err_str:
-            return "The invite hash is invalid or malformed."
-        elif "already" in err_str and "participant" in err_str:
-            return "You are already a member of this chat."
-        return log_and_format_error("join_chat_by_link", e, link=link)
+    """Join a chat by invite link if its target satisfies the chat allowlist."""
+    invite_hash = link.rsplit("/", 1)[-1].removeprefix("+")
+    return await _join_chat_invite(invite_hash, account, "join_chat_by_link")
 
 
 @mcp.tool(
@@ -1756,65 +1765,8 @@ async def export_chat_invite(chat_id: Union[int, str], account: Optional[str] = 
 @with_account(readonly=False)
 @flood_category("channel_lifecycle")
 async def import_chat_invite(hash: str, account: Optional[str] = None) -> str:
-    """
-    Import a chat invite by hash.
-    """
-    try:
-        cl = get_client(account)
-        await ensure_connected(cl)
-        # Remove any prefixes like '+' if present
-        if hash.startswith("+"):
-            hash = hash[1:]
-
-        # Try checking the invite before joining
-        invite_info = None
-        try:
-            from telethon.errors import (
-                InviteHashExpiredError,
-                InviteHashInvalidError,
-                UserAlreadyParticipantError,
-                ChatAdminRequiredError,
-                UsersTooMuchError,
-            )
-
-            # Try to check invite info first (will often fail if not a member)
-            invite_info = await cl(functions.messages.CheckChatInviteRequest(hash=hash))
-        except Exception:
-            # This often fails if not a member - just continue
-            pass
-
-        if getattr(invite_info, "chat", None):
-            if is_chat_blocked(get_marked_id(invite_info.chat), invite_info.chat):
-                return "Already a member of this chat."
-            chat_title = sanitize_name(getattr(invite_info.chat, "title", "Unknown Chat"))
-            return f"You are already a member of this chat: {chat_title}"
-
-        # Join the chat using the hash
-        try:
-            result = await cl(functions.messages.ImportChatInviteRequest(hash=hash))
-            if result and hasattr(result, "chats") and result.chats:
-                if is_chat_blocked(get_marked_id(result.chats[0]), result.chats[0]):
-                    return "Joined chat via invite hash."
-                chat_title = sanitize_name(getattr(result.chats[0], "title", "Unknown Chat"))
-                return f"Successfully joined chat: {chat_title}"
-            return "Joined chat via invite hash."
-        except Exception as join_err:
-            err_str = str(join_err).lower()
-            if "expired" in err_str:
-                return "The invite hash has expired and is no longer valid."
-            elif "invalid" in err_str:
-                return "The invite hash is invalid or malformed."
-            elif "already" in err_str and "participant" in err_str:
-                return "You are already a member of this chat."
-            elif "admin" in err_str:
-                return "Cannot join this chat - requires admin approval."
-            elif "too much" in err_str or "too many" in err_str:
-                return "Cannot join this chat - it has reached maximum number of participants."
-            else:
-                raise  # Re-raise to be caught by the outer exception handler
-
-    except Exception as e:
-        return log_and_format_error("import_chat_invite", e, hash=hash)
+    """Import a chat invite by hash if its target satisfies the chat allowlist."""
+    return await _join_chat_invite(hash.removeprefix("+"), account, "import_chat_invite")
 
 
 @mcp.tool(

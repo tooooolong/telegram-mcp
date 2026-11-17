@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -268,22 +269,31 @@ class _FakeStringSession:
         return "NEWSESSION"
 
 
-def test_env_update_keeps_utf8_file_under_windows_locale(monkeypatch, tmp_path):
+@pytest.mark.parametrize("unsafe_link", [False, True])
+def test_env_update_keeps_utf8_and_protects_credentials(monkeypatch, tmp_path, unsafe_link):
     # .env is UTF-8 (python-dotenv reads it that way); the update must not fall
     # back to the locale encoding, here cp1252 as on an English Windows install.
-    real_open = open
+    real_fdopen = os.fdopen
 
-    def locale_open(file, mode="r", *args, encoding=None, **kwargs):
+    def locale_fdopen(fd, mode="r", *args, encoding=None, **kwargs):
         if "b" not in mode and encoding is None:
             encoding = "cp1252"
-        return real_open(file, mode, *args, encoding=encoding, **kwargs)
+        return real_fdopen(fd, mode, *args, encoding=encoding, **kwargs)
 
     env_file = tmp_path / ".env"
-    original = "# Настройки Telegram\nTELEGRAM_API_ID=1\n"
-    env_file.write_text(original, encoding="utf-8")
+    original = "# Настройки Telegram\nTELEGRAM_API_ID=1"
+    source = tmp_path / "existing.env" if unsafe_link else env_file
+    source.write_text(original, encoding="utf-8")
+    source.chmod(0o644)
+    original_inode = source.stat().st_ino
+    if unsafe_link:
+        try:
+            env_file.symlink_to(source)
+        except OSError as exc:
+            pytest.skip(f"creating symlinks is unavailable: {exc}")
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(session_string_generator, "open", locale_open, raising=False)
+    monkeypatch.setattr(session_string_generator.os, "fdopen", locale_fdopen)
     monkeypatch.setattr("sys.argv", ["session_string_generator.py", "--qr"])
     monkeypatch.setenv("TELEGRAM_API_ID", "1")
     monkeypatch.setenv("TELEGRAM_API_HASH", "hash")
@@ -297,9 +307,50 @@ def test_env_update_keeps_utf8_file_under_windows_locale(monkeypatch, tmp_path):
 
     session_string_generator.main()
 
-    assert env_file.read_text(encoding="utf-8") == (
-        original + "TELEGRAM_SESSION_STRING=NEWSESSION\n"
+    if unsafe_link:
+        assert env_file.is_symlink()
+        assert source.read_text(encoding="utf-8") == original
+    else:
+        assert env_file.read_text(encoding="utf-8") == (
+            original + "\nTELEGRAM_SESSION_STRING=NEWSESSION\n"
+        )
+        if os.name != "nt":
+            assert env_file.stat().st_mode & 0o777 == 0o600
+            assert env_file.stat().st_ino != original_inode
+
+
+def test_env_update_replaces_only_the_selected_account(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TELEGRAM_SESSION_STRING=DEFAULT\nTELEGRAM_SESSION_STRING_WORK=OLD\n", encoding="utf-8"
     )
+
+    session_string_generator._update_env_file("TELEGRAM_SESSION_STRING_WORK", "NEW")
+
+    assert env_file.read_text(encoding="utf-8") == (
+        "TELEGRAM_SESSION_STRING=DEFAULT\nTELEGRAM_SESSION_STRING_WORK=NEW\n"
+    )
+
+
+def test_env_update_failed_publish_keeps_original_file(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("TELEGRAM_SESSION_STRING=OLD\n", encoding="utf-8")
+
+    def fail_replace(source, destination):
+        assert source.read_text(encoding="utf-8") == "TELEGRAM_SESSION_STRING=NEW\n"
+        if os.name != "nt":
+            assert source.stat().st_mode & 0o777 == 0o600
+        assert destination.read_text(encoding="utf-8") == "TELEGRAM_SESSION_STRING=OLD\n"
+        raise OSError("storage failure")
+
+    monkeypatch.setattr(session_string_generator.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="storage failure"):
+        session_string_generator._update_env_file("TELEGRAM_SESSION_STRING", "NEW")
+
+    assert list(tmp_path.iterdir()) == [env_file]
+    assert env_file.read_text(encoding="utf-8") == "TELEGRAM_SESSION_STRING=OLD\n"
 
 
 def test_dash_account_label_suggests_shell_safe_env_var(monkeypatch, capsys):

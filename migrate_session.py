@@ -15,6 +15,7 @@ from telethon.sessions import SQLiteSession, StringSession
 from telegram_mcp.account_labels import canonical_account_label
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
+from telegram_mcp.private_files import create_private_file, private_staging_directory
 
 
 def _parse_args() -> argparse.Namespace:
@@ -77,7 +78,8 @@ def _target_paths(target: str) -> tuple[str, Path]:
     if expanded.name.endswith(".session"):
         expanded = expanded.with_name(expanded.name[: -len(".session")])
     session_name = str(expanded)
-    return session_name, Path(f"{session_name}.session").resolve()
+    session_file = Path(f"{session_name}.session")
+    return session_name, session_file.parent.resolve() / session_file.name
 
 
 async def migrate(
@@ -87,46 +89,47 @@ async def migrate(
     target: str,
 ) -> tuple[Path, object]:
     """Copy auth material into a new SQLite session and verify it with Telegram."""
-    session_name, session_file = _target_paths(target)
-    if session_file.exists():
-        raise FileExistsError(
-            f"destination already exists: {session_file}. Choose another --target."
-        )
-
-    sqlite_session = None
-    client = None
+    _, session_file = _target_paths(target)
+    exists_error = f"destination already exists: {session_file}. Choose another --target."
     try:
-        source = StringSession(session_string)
-        sqlite_session = SQLiteSession(session_name)
-        sqlite_session.set_dc(source.dc_id, source.server_address, source.port)
-        sqlite_session.auth_key = source.auth_key
-        sqlite_session.save()
-
-        client = TelegramClient(
-            sqlite_session,
-            api_id,
-            api_hash,
-            **client_identity_kwargs(),
-        )
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise RuntimeError("the source session is not authorized")
-        user = await client.get_me()
-    except Exception:
-        if client is not None:
-            await client.disconnect()
-        elif sqlite_session is not None:
-            sqlite_session.close()
-        session_file.unlink(missing_ok=True)
-        raise
-    else:
-        await client.disconnect()
-
-    try:
-        session_file.chmod(0o600)
-    except OSError:
-        # Some filesystems do not implement POSIX permissions.
+        session_file.lstat()
+    except FileNotFoundError:
         pass
+    else:
+        raise FileExistsError(exists_error)
+
+    source = StringSession(session_string)
+    with private_staging_directory(session_file.parent) as directory:
+        # SQLite reopens by name and can create journal files beside the database.
+        staged = directory / "migration.session"
+        os.close(create_private_file(staged))
+        sqlite_session = SQLiteSession(str(staged))
+        try:
+            sqlite_session.set_dc(source.dc_id, source.server_address, source.port)
+            sqlite_session.auth_key = source.auth_key
+            sqlite_session.save()
+
+            client = TelegramClient(
+                sqlite_session,
+                api_id,
+                api_hash,
+                **client_identity_kwargs(),
+            )
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise RuntimeError("the source session is not authorized")
+                user = await client.get_me()
+            finally:
+                await client.disconnect()
+        finally:
+            sqlite_session.close()
+
+        # Publish the verified inode only if the target is still unoccupied.
+        try:
+            os.link(staged, session_file)
+        except FileExistsError as exc:
+            raise FileExistsError(exists_error) from exc
     return session_file, user
 
 

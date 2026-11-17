@@ -5,6 +5,11 @@
 *.session-journal
 *.log
 data/
+transcript_cache/
+downloads/
+uploads/
+aliases.json
+incoming_feed.jsonl
 
 # Environments and caches
 .venv/

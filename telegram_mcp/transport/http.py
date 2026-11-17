@@ -1,14 +1,21 @@
-"""Streamable HTTP transport with MCP 2026-07-28 protocol negotiation support."""
+"""Authenticated MCP network transports and streamable HTTP protocol negotiation."""
 
 from __future__ import annotations
 
+import hmac
 import logging
+import os
+import re
 from typing import Any, Optional
 
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.applications import Starlette
+from starlette.datastructures import MutableHeaders
 from starlette.responses import JSONResponse, Response
+from starlette.routing import Match
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from telegram_mcp.media_links import MEDIA_ROUTE_PREFIX, UPLOAD_ROUTE_PREFIX
 from telegram_mcp.transport.protocol import (
     DEFAULT_PROTOCOL_VERSION,
     LATEST_PROTOCOL_VERSION,
@@ -19,9 +26,44 @@ from telegram_mcp.transport.protocol import (
 
 logger = logging.getLogger(__name__)
 
-# Browser origins accepted when the FastMCP instance carries no explicit
-# transport security settings: the same local-only defaults FastMCP itself uses.
+_DEFAULT_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
 _DEFAULT_ALLOWED_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
+
+
+def require_http_auth_token() -> bytes:
+    token = os.getenv("MCP_AUTH_TOKEN", "")
+    if not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token):
+        raise RuntimeError("Set MCP_AUTH_TOKEN to a valid bearer token to enable HTTP or SSE.")
+    return token.encode("ascii")
+
+
+def configure_transport_security(mcp_instance: FastMCP) -> None:
+    allowed_hosts = [
+        value.strip() for value in os.getenv("MCP_ALLOWED_HOSTS", "").split(",") if value.strip()
+    ]
+    allowed_origins = [
+        value.strip() for value in os.getenv("MCP_ALLOWED_ORIGINS", "").split(",") if value.strip()
+    ]
+    if not allowed_hosts:
+        allowed_hosts = list(_DEFAULT_ALLOWED_HOSTS)
+        if not allowed_origins:
+            allowed_origins = list(_DEFAULT_ALLOWED_ORIGINS)
+
+    mcp_instance.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
+def _has_bearer_token(headers: list[tuple[bytes, bytes]], expected_token: bytes) -> bool:
+    values = [value for key, value in headers if key == b"authorization"]
+    if len(values) != 1:
+        return False
+    scheme, _, credentials = values[0].partition(b" ")
+    return scheme.lower() == b"bearer" and hmac.compare_digest(
+        credentials.lstrip(b" "), expected_token
+    )
 
 
 def _origin_matches(origin: str, allowed_origins: Any) -> bool:
@@ -36,50 +78,26 @@ def _origin_matches(origin: str, allowed_origins: Any) -> bool:
     return False
 
 
-def is_origin_allowed(origin: Optional[str], mcp_instance: Any = None) -> bool:
-    """Return True when a request with this Origin header may reach the server.
-
-    Requests without an Origin header come from non-browser MCP clients and are
-    allowed. A browser always sends Origin on cross-origin requests, so any other
-    web page is refused unless MCP_ALLOWED_ORIGINS (or FastMCP's own settings)
-    names it, or the operator turned DNS-rebinding protection off explicitly.
-    """
-    if not origin:
-        return True
-    settings = getattr(getattr(mcp_instance, "settings", None), "transport_security", None)
-    if settings is None:
-        return _origin_matches(origin, _DEFAULT_ALLOWED_ORIGINS)
-    if not getattr(settings, "enable_dns_rebinding_protection", True):
-        return True
-    return _origin_matches(origin, getattr(settings, "allowed_origins", ()))
-
-
 class ProtocolNegotiationMiddleware:
-    """ASGI middleware that enforces MCP protocol negotiation and response headers.
+    """Protect network routes and negotiate the streamable HTTP protocol."""
 
-    Features:
-    - Validates MCP-Protocol-Version request header against supported versions.
-    - Rejects unsupported versions with a standard JSON-RPC 400 Bad Request error.
-    - Injects negotiated MCP-Protocol-Version into every HTTP response.
-    - Refuses requests whose Origin is not allowed (cross-origin request forgery),
-      including CORS preflights and the signed media/upload routes.
-    - Handles CORS and OPTIONS preflight requests, echoing only allowed origins.
-    - Provides a JSON discovery response for plain GET probes (non-SSE) on the MCP endpoint.
-    """
-
-    def __init__(self, app: ASGIApp, mcp_instance: Any = None):
+    def __init__(self, app: Starlette, mcp_instance: FastMCP, token: bytes, *, streamable: bool):
         self.app = app
-        self.mcp_instance = mcp_instance
+        self.allowed_origins = tuple(mcp_instance.settings.transport_security.allowed_origins)
+        self.streamable_path = mcp_instance.settings.streamable_http_path if streamable else None
+        self.signed_endpoints = frozenset(getattr(mcp_instance, "_signed_endpoints", ()))
+        self.token = token
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers", []))
+        raw_headers = scope.get("headers", [])
+        headers = dict(raw_headers)
         raw_origin = headers.get(b"origin")
         origin = raw_origin.decode("latin-1").strip() if raw_origin else None
-        if not is_origin_allowed(origin, self.mcp_instance):
+        if origin and not _origin_matches(origin, self.allowed_origins):
             logger.warning("Rejected request from disallowed Origin: %s", origin)
             response = Response("Invalid Origin header", status_code=403)
             await response(scope, receive, send)
@@ -88,12 +106,63 @@ class ProtocolNegotiationMiddleware:
             {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if origin else {}
         )
 
-        # The signed file routes are plain HTTP, not MCP: no negotiation, no discovery probe.
-        if scope.get("path", "").startswith((MEDIA_ROUTE_PREFIX, UPLOAD_ROUTE_PREFIX)):
+        route = next(
+            (route for route in self.app.routes if route.matches(scope)[0] is Match.FULL), None
+        )
+        if getattr(route, "endpoint", None) in self.signed_endpoints:
             await self.app(scope, receive, send)
             return
 
-        await self._negotiate(scope, receive, send, headers, cors_origin_headers)
+        # Preflight is answered here without executing any app route.
+        if scope["method"] == "OPTIONS":
+            response = Response(
+                status_code=204,
+                headers={
+                    "Allow": "GET, POST, DELETE, OPTIONS, HEAD",
+                    **cors_origin_headers,
+                    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, HEAD",
+                    "Access-Control-Allow-Headers": (
+                        "Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Authorization"
+                    ),
+                    "Access-Control-Expose-Headers": "MCP-Protocol-Version, MCP-Session-Id",
+                },
+            )
+            if self.streamable_path is not None:
+                response.headers[MCP_PROTOCOL_VERSION_HEADER] = (
+                    headers.get(MCP_PROTOCOL_VERSION_HEADER.encode("latin-1"), b"")
+                    .decode("latin-1")
+                    .strip()
+                    or LATEST_PROTOCOL_VERSION
+                )
+            await response(scope, receive, send)
+            return
+
+        if not _has_bearer_token(raw_headers, self.token):
+            response = Response(
+                "Bearer authentication required",
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer", **cors_origin_headers},
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_with_origin(message: Message) -> None:
+            if origin and message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers["Access-Control-Allow-Origin"] = origin
+                vary = response_headers.get("Vary", "")
+                if "origin" not in {value.strip().lower() for value in vary.split(",")}:
+                    response_headers.add_vary_header("Origin")
+            await send(message)
+
+        if self.streamable_path is None:
+            await self.app(scope, receive, send_with_origin)
+            return
+
+        is_mcp_endpoint = getattr(route, "path", None) == self.streamable_path
+        await self._negotiate(
+            scope, receive, send_with_origin, headers, cors_origin_headers, is_mcp_endpoint
+        )
 
     async def _negotiate(
         self,
@@ -102,32 +171,13 @@ class ProtocolNegotiationMiddleware:
         send: Send,
         headers: dict,
         cors_origin_headers: dict,
+        is_mcp_endpoint: bool,
     ) -> None:
         raw_version_bytes = headers.get(MCP_PROTOCOL_VERSION_HEADER.encode("latin-1"))
         requested_version = (
             raw_version_bytes.decode("latin-1").strip() if raw_version_bytes else None
         )
 
-        # 1. Handle OPTIONS discovery / CORS preflight
-        if scope.get("method") == "OPTIONS":
-            cors_headers = (
-                "Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Authorization"
-            )
-            response = Response(
-                status_code=204,
-                headers={
-                    "Allow": "GET, POST, DELETE, OPTIONS, HEAD",
-                    MCP_PROTOCOL_VERSION_HEADER: requested_version or LATEST_PROTOCOL_VERSION,
-                    **cors_origin_headers,
-                    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, HEAD",
-                    "Access-Control-Allow-Headers": cors_headers,
-                    "Access-Control-Expose-Headers": "MCP-Protocol-Version, MCP-Session-Id",
-                },
-            )
-            await response(scope, receive, send)
-            return
-
-        # 2. Validate protocol version if provided
         if requested_version:
             if requested_version not in SUPPORTED_PROTOCOL_VERSIONS:
                 supported_str = ", ".join(SUPPORTED_PROTOCOL_VERSIONS)
@@ -155,9 +205,13 @@ class ProtocolNegotiationMiddleware:
         else:
             negotiated_version = DEFAULT_PROTOCOL_VERSION
 
-        # 3. Handle plain GET discovery probe (clients querying without text/event-stream)
+        # Plain GET probes receive discovery metadata on the MCP route.
         accept_header = headers.get(b"accept", b"").decode("latin-1").lower()
-        if scope.get("method") == "GET" and "text/event-stream" not in accept_header:
+        if (
+            is_mcp_endpoint
+            and scope["method"] == "GET"
+            and "text/event-stream" not in accept_header
+        ):
             discovery_data = {
                 "name": "telegram",
                 "version": "2.0.1",
@@ -177,7 +231,6 @@ class ProtocolNegotiationMiddleware:
             await response(scope, receive, send)
             return
 
-        # 4. Wrap send to inject MCP-Protocol-Version header on all response start messages
         async def send_with_protocol_header(message: Message) -> None:
             if message["type"] == "http.response.start":
                 resp_headers = list(message.get("headers", []))
@@ -201,63 +254,70 @@ class ProtocolNegotiationMiddleware:
         await self.app(scope, receive, send_with_protocol_header)
 
 
-def patch_fastmcp_streamable_http() -> None:
-    """Patch FastMCP.streamable_http_app to enforce MCP 2026-07-28 protocol negotiation."""
-    try:
-        from mcp.server.fastmcp import FastMCP
+class TelegramFastMCP(FastMCP):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._signed_endpoints: set = set()
 
-        if getattr(FastMCP, "_protocol_negotiation_patched", False):
-            return
+    def signed_route(self, path: str, *, methods: list[str]):
+        """Register a route whose handler verifies its own signed URL."""
 
-        original_streamable_http_app = FastMCP.streamable_http_app
+        def register(endpoint):
+            self._signed_endpoints.add(endpoint)
+            return self.custom_route(path, methods=methods)(endpoint)
 
-        def wrapped_streamable_http_app(self: Any, *args: Any, **kwargs: Any) -> Any:
-            app = original_streamable_http_app(self, *args, **kwargs)
-            return ProtocolNegotiationMiddleware(app, self)
+        return register
 
-        FastMCP.streamable_http_app = wrapped_streamable_http_app  # type: ignore[assignment]
-        FastMCP._protocol_negotiation_patched = True  # type: ignore[attr-defined]
-    except (ImportError, AttributeError) as exc:
-        logger.debug("Could not monkey-patch FastMCP.streamable_http_app: %s", exc)
+    def streamable_http_app(self) -> ASGIApp:
+        return _build_streamable_http_app(self, super().streamable_http_app)
+
+    def sse_app(self, mount_path: Optional[str] = None) -> ASGIApp:
+        token = require_http_auth_token()
+        configure_transport_security(self)
+        return ProtocolNegotiationMiddleware(
+            super().sse_app(mount_path), self, token, streamable=False
+        )
+
+    async def run_streamable_http_async(self) -> None:
+        await run_streamable_http_async(self)
+
+    async def run_sse_async(self, mount_path: Optional[str] = None) -> None:
+        await _run_network_app(self, self.sse_app(mount_path))
 
 
-def create_streamable_http_app(mcp_instance: Any) -> Any:
-    """Build and wrap the Starlette app from FastMCP with protocol negotiation."""
+def _build_streamable_http_app(mcp_instance: FastMCP, app_factory) -> ASGIApp:
+    token = require_http_auth_token()
+    configure_transport_security(mcp_instance)
     install_protocol_compatibility()
-    if not hasattr(mcp_instance, "streamable_http_app"):
-        return mcp_instance
 
-    # If the FastMCP session manager already ran and shut down, reset it to allow clean restart
-    session_mgr = getattr(mcp_instance, "_session_manager", None)
+    # A session manager that has shut down cannot serve a new app lifespan.
+    session_mgr = mcp_instance._session_manager
     if session_mgr is not None and getattr(session_mgr, "_has_started", False):
         mcp_instance._session_manager = None
 
-    app = mcp_instance.streamable_http_app()
-    # If not already wrapped via monkeypatch
-    if not isinstance(app, ProtocolNegotiationMiddleware):
-        app = ProtocolNegotiationMiddleware(app, mcp_instance)
-    return app
+    return ProtocolNegotiationMiddleware(app_factory(), mcp_instance, token, streamable=True)
 
 
-async def run_streamable_http_async(mcp_instance: Any) -> None:
-    """Run FastMCP streamable HTTP transport with protocol negotiation middleware."""
-    install_protocol_compatibility()
-    patch_fastmcp_streamable_http()
+def create_streamable_http_app(mcp_instance: FastMCP) -> ASGIApp:
+    """Build the authenticated app with MCP protocol negotiation."""
+    if isinstance(mcp_instance, TelegramFastMCP):
+        return mcp_instance.streamable_http_app()
+    return _build_streamable_http_app(mcp_instance, mcp_instance.streamable_http_app)
 
-    if not hasattr(mcp_instance, "streamable_http_app"):
-        if hasattr(mcp_instance, "run_streamable_http_async"):
-            await mcp_instance.run_streamable_http_async()
-            return
 
+async def _run_network_app(mcp_instance: FastMCP, app: ASGIApp) -> None:
     import uvicorn
-
-    app = create_streamable_http_app(mcp_instance)
 
     config = uvicorn.Config(
         app,
         host=mcp_instance.settings.host,
         port=mcp_instance.settings.port,
         log_level=mcp_instance.settings.log_level.lower(),
+        # Access logs include query strings, which contain signed media credentials.
+        access_log=False,
     )
-    server = uvicorn.Server(config)
-    await server.serve()
+    await uvicorn.Server(config).serve()
+
+
+async def run_streamable_http_async(mcp_instance: FastMCP) -> None:
+    await _run_network_app(mcp_instance, create_streamable_http_app(mcp_instance))

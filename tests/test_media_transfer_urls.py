@@ -31,8 +31,11 @@ def root(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client():
-    with TestClient(create_streamable_http_app(runtime.mcp)) as c:
+def client(monkeypatch):
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
+    with TestClient(
+        create_streamable_http_app(runtime.mcp), base_url="http://localhost:8765"
+    ) as c:
         yield c
 
 

@@ -27,6 +27,7 @@ import io
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import errors
@@ -35,6 +36,11 @@ from telethon.sync import TelegramClient
 from telegram_mcp.account_labels import canonical_account_label
 from telegram_mcp.client_identity import client_identity_kwargs
 from telegram_mcp.install_guard import UnsafeInstallationError, assert_safe_distribution
+from telegram_mcp.private_files import (
+    create_private_file,
+    open_existing_regular,
+    private_staging_directory,
+)
 
 # How many times the QR code is regenerated after expiry before giving up.
 _QR_MAX_REFRESHES = 10
@@ -183,6 +189,29 @@ def _phone_login(client: TelegramClient) -> None:
         client.sign_in(password=pw)
 
 
+def _update_env_file(env_var: str, session_string: str) -> None:
+    path = Path.cwd() / ".env"
+    with private_staging_directory(path.parent) as directory:
+        # python-dotenv reads .env as UTF-8, independent of the locale.
+        with os.fdopen(open_existing_regular(path, os.O_RDONLY), encoding="utf-8") as source:
+            lines = source.readlines()
+
+        assignment = f"{env_var}={session_string}\n"
+        for index, line in enumerate(lines):
+            if line.startswith(f"{env_var}="):
+                lines[index] = assignment
+                break
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(assignment)
+
+        staged = directory / path.name
+        with os.fdopen(create_private_file(staged), "w", encoding="utf-8") as output:
+            output.writelines(lines)
+        os.replace(staged, path)
+
+
 def main() -> None:
     _harden_stdio()
     args = _parse_args()
@@ -266,24 +295,7 @@ def main() -> None:
             choice = "n"
         if choice.lower() == "y":
             try:
-                # python-dotenv reads .env as UTF-8; the locale default
-                # (cp1252, cp1251, cp936 on Windows) can't decode it.
-                with open(".env", "r", encoding="utf-8") as file:
-                    env_contents = file.readlines()
-
-                session_string_line_found = False
-                for i, line in enumerate(env_contents):
-                    if line.startswith(f"{env_var}="):
-                        env_contents[i] = f"{env_var}={session_string}\n"
-                        session_string_line_found = True
-                        break
-
-                if not session_string_line_found:
-                    env_contents.append(f"{env_var}={session_string}\n")
-
-                with open(".env", "w", encoding="utf-8") as file:
-                    file.writelines(env_contents)
-
+                _update_env_file(env_var, session_string)
                 print("\n.env file updated successfully!")
             except Exception as e:
                 print(f"\nError updating .env file: {e}")

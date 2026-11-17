@@ -31,6 +31,10 @@ class SearchServer(TelegramClient):
         super().__init__(StringSession(), 12345, "dummy_hash")
         self.requests = []
 
+    async def get_me(self, *, input_peer):
+        assert input_peer
+        return types.InputPeerUser(51, 0)
+
     async def __call__(self, request, ordered=False, flood_sleep_threshold=None):
         assert isinstance(request, functions.messages.SearchGlobalRequest)
         self.requests.append((request.offset_id, request.limit))

@@ -22,7 +22,7 @@ def _voice_msg(**overrides):
     base = dict(
         id=1,
         message=None,
-        voice=SimpleNamespace(),
+        voice=SimpleNamespace(id=911),
         video_note=None,
         file=SimpleNamespace(duration=23, ext=".oga", mime_type="audio/ogg"),
     )
@@ -80,12 +80,12 @@ def test_validate_transcription_config_raises_on_bad_mode(monkeypatch):
 
 
 def test_cache_miss_returns_none(transcript_cache_dir):
-    assert transcription.get_cached_transcript(1, 2) is None
+    assert transcription.get_cached_transcript(101, 1, 2, 911) is None
 
 
 def test_cache_round_trip(transcript_cache_dir):
-    transcription.save_transcript(1, 2, "groq", "hello world", duration=23, lang="ru")
-    cached = transcription.get_cached_transcript(1, 2)
+    transcription.save_transcript(101, 1, 2, 911, "groq", "hello world", duration=23, lang="ru")
+    cached = transcription.get_cached_transcript(101, 1, 2, 911)
     assert cached["text"] == "hello world"
     assert cached["source"] == "groq"
     assert cached["duration"] == 23
@@ -94,48 +94,54 @@ def test_cache_round_trip(transcript_cache_dir):
 
 
 def test_cache_upsert_overwrites_previous_entry(transcript_cache_dir):
-    transcription.save_transcript(1, 2, "telegram", "first pass")
-    transcription.save_transcript(1, 2, "groq", "second pass")
-    cached = transcription.get_cached_transcript(1, 2)
+    transcription.save_transcript(101, 1, 2, 911, "telegram", "first pass")
+    transcription.save_transcript(101, 1, 2, 911, "groq", "second pass")
+    cached = transcription.get_cached_transcript(101, 1, 2, 911)
     assert cached["text"] == "second pass"
     assert cached["source"] == "groq"
 
 
 def test_cache_keyed_by_chat_and_message_independently(transcript_cache_dir):
-    transcription.save_transcript(1, 100, "groq", "chat one")
-    transcription.save_transcript(2, 100, "groq", "chat two")
-    assert transcription.get_cached_transcript(1, 100)["text"] == "chat one"
-    assert transcription.get_cached_transcript(2, 100)["text"] == "chat two"
-    assert transcription.get_cached_transcript(1, 999) is None
+    transcription.save_transcript(101, 1, 100, 911, "groq", "chat one")
+    transcription.save_transcript(101, 2, 100, 911, "groq", "chat two")
+    assert transcription.get_cached_transcript(101, 1, 100, 911)["text"] == "chat one"
+    assert transcription.get_cached_transcript(101, 2, 100, 911)["text"] == "chat two"
+    assert transcription.get_cached_transcript(101, 1, 999, 911) is None
 
 
 def test_cache_pinned_to_an_engine_never_serves_the_other_engines_text(transcript_cache_dir):
     """The whole point of choosing groq is that the native engine drops the
     recording's last segment. A telegram transcript answering a groq request
     would hand back that truncated text with no way to tell."""
-    transcription.save_transcript(1, 2, "telegram", "truncated tail")
-    assert transcription.get_cached_transcript(1, 2, source="groq") is None
-    assert transcription.get_cached_transcript(1, 2, source="telegram")["text"] == (
+    transcription.save_transcript(101, 1, 2, 911, "telegram", "truncated tail")
+    assert transcription.get_cached_transcript(101, 1, 2, 911, source="groq") is None
+    assert transcription.get_cached_transcript(101, 1, 2, 911, source="telegram")["text"] == (
         "truncated tail"
     )
 
 
 def test_cache_keeps_both_engines_side_by_side(transcript_cache_dir):
-    transcription.save_transcript(1, 2, "telegram", "native text")
-    transcription.save_transcript(1, 2, "groq", "groq text")
-    assert transcription.get_cached_transcript(1, 2, source="telegram")["text"] == "native text"
-    assert transcription.get_cached_transcript(1, 2, source="groq")["text"] == "groq text"
+    transcription.save_transcript(101, 1, 2, 911, "telegram", "native text")
+    transcription.save_transcript(101, 1, 2, 911, "groq", "groq text")
+    assert (
+        transcription.get_cached_transcript(101, 1, 2, 911, source="telegram")["text"]
+        == "native text"
+    )
+    assert (
+        transcription.get_cached_transcript(101, 1, 2, 911, source="groq")["text"] == "groq text"
+    )
 
 
-def test_legacy_cache_keyed_without_engine_is_migrated_in_place(transcript_cache_dir):
-    """Builds before the fix keyed on (chat_id, message_id) alone. Rows must
-    survive the rebuild, and the pinned lookup must start working on them."""
+@pytest.mark.parametrize("legacy_key", ["chat_id, message_id", "chat_id, message_id, source"])
+def test_legacy_cache_is_preserved_and_account_cache_starts_empty(
+    transcript_cache_dir, legacy_key
+):
     import sqlite3
 
     path = transcription._cache_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
-    conn.executescript("""
+    conn.executescript(f"""
         CREATE TABLE transcripts (
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
@@ -144,23 +150,28 @@ def test_legacy_cache_keyed_without_engine_is_migrated_in_place(transcript_cache
             duration INTEGER,
             lang TEXT,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, message_id)
+            PRIMARY KEY ({legacy_key})
         );
         INSERT INTO transcripts VALUES (1, 2, 'telegram', 'old row', 23, 'ru', '2026-08-20');
         """)
     conn.commit()
     conn.close()
 
-    assert transcription.get_cached_transcript(1, 2, source="telegram")["text"] == "old row"
-    assert transcription.get_cached_transcript(1, 2, source="groq") is None
-    transcription.save_transcript(1, 2, "groq", "new row")
-    assert transcription.get_cached_transcript(1, 2, source="groq")["text"] == "new row"
-    assert transcription.get_cached_transcript(1, 2, source="telegram")["text"] == "old row"
+    assert transcription.get_cached_transcript(101, 1, 2, 911, source="telegram") is None
+    assert transcription.get_cached_transcript(101, 1, 2, 911, source="groq") is None
+    transcription.save_transcript(101, 1, 2, 911, "groq", "new row")
+    assert transcription.get_cached_transcript(101, 1, 2, 911, source="groq")["text"] == "new row"
+    assert transcription.get_cached_transcript(102, 1, 2, 911, source="groq") is None
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("SELECT text FROM transcripts").fetchall() == [("old row",)]
+    finally:
+        conn.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions only")
 def test_cache_file_and_directory_get_restrictive_permissions(transcript_cache_dir):
-    transcription.save_transcript(1, 2, "groq", "hi")
+    transcription.save_transcript(101, 1, 2, 911, "groq", "hi")
     db_path = transcription.cache_dir() / "transcripts.db"
     assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(transcript_cache_dir.stat().st_mode) == 0o700
@@ -236,7 +247,7 @@ def test_budget_seconds_cap():
 
 def test_voice_attachment_info_none_for_non_voice_message():
     msg = SimpleNamespace(id=1, voice=None, video_note=None, file=None)
-    assert transcription.voice_attachment_info(msg, chat_id=1) is None
+    assert transcription.voice_attachment_info(msg, chat_id=1, account_id=101) is None
 
 
 def test_voice_attachment_info_shows_duration_only_without_chat_id(monkeypatch):
@@ -252,8 +263,8 @@ def test_voice_attachment_info_shows_duration_only_without_chat_id(monkeypatch):
 
 def test_voice_attachment_info_disabled_when_mode_off(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "off")
-    transcription.save_transcript(1, 1, "groq", "should not surface")
-    info = transcription.voice_attachment_info(_voice_msg(id=1), chat_id=1)
+    transcription.save_transcript(101, 1, 1, 911, "groq", "should not surface")
+    info = transcription.voice_attachment_info(_voice_msg(id=1), chat_id=1, account_id=101)
     assert info["transcript_status"] is None
     assert info["transcript"] is None
     assert info["duration"] == 23  # duration is free, shown regardless of the toggle
@@ -261,8 +272,8 @@ def test_voice_attachment_info_disabled_when_mode_off(monkeypatch, transcript_ca
 
 def test_voice_attachment_info_cache_hit_is_ready(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
-    transcription.save_transcript(1, 1, "groq", "hello", duration=23)
-    info = transcription.voice_attachment_info(_voice_msg(id=1), chat_id=1)
+    transcription.save_transcript(101, 1, 1, 911, "groq", "hello", duration=23)
+    info = transcription.voice_attachment_info(_voice_msg(id=1), chat_id=1, account_id=101)
     assert info["transcript_status"] == "ready"
     assert info["transcript"] == "hello"
     assert info["transcript_source"] == "groq"
@@ -270,7 +281,7 @@ def test_voice_attachment_info_cache_hit_is_ready(monkeypatch, transcript_cache_
 
 def test_voice_attachment_info_cache_miss_is_pending(monkeypatch, transcript_cache_dir):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
-    info = transcription.voice_attachment_info(_voice_msg(id=99), chat_id=1)
+    info = transcription.voice_attachment_info(_voice_msg(id=99), chat_id=1, account_id=101)
     assert info["transcript_status"] == "pending"
     assert info["transcript"] is None
 
@@ -575,9 +586,9 @@ async def test_prefetch_is_noop_outside_auto_mode(monkeypatch, transcript_cache_
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
     monkeypatch.setattr(transcription, "transcribe", _async_return({"status": "ok", "text": "x"}))
 
-    await transcription.prefetch_transcripts(None, None, 1, [_voice_msg(id=1)])
+    await transcription.prefetch_transcripts(None, None, 1, [_voice_msg(id=1)], account_id=101)
 
-    assert transcription.get_cached_transcript(1, 1) is None
+    assert transcription.get_cached_transcript(101, 1, 1, 911) is None
 
 
 @pytest.mark.asyncio
@@ -594,11 +605,15 @@ async def test_prefetch_fills_cache_up_to_voice_budget(monkeypatch, transcript_c
 
     monkeypatch.setattr(transcription, "transcribe", _fake_transcribe)
 
-    await transcription.prefetch_transcripts(None, None, 7, [_voice_msg(id=1), _voice_msg(id=2)])
+    await transcription.prefetch_transcripts(
+        None, None, 7, [_voice_msg(id=1), _voice_msg(id=2)], account_id=101
+    )
 
     assert calls == [1]  # budget exhausted after the first voice message
-    assert transcription.get_cached_transcript(7, 1)["text"] == "text-1"
-    assert transcription.get_cached_transcript(7, 2) is None  # left for next explicit call
+    assert transcription.get_cached_transcript(101, 7, 1, 911)["text"] == "text-1"
+    assert (
+        transcription.get_cached_transcript(101, 7, 2, 911) is None
+    )  # left for next explicit call
 
 
 @pytest.mark.asyncio
@@ -606,7 +621,7 @@ async def test_prefetch_skips_cached_and_already_texted_messages(
     monkeypatch, transcript_cache_dir
 ):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "auto")
-    transcription.save_transcript(7, 1, "telegram", "already have it")
+    transcription.save_transcript(101, 7, 1, 911, "telegram", "already have it")
     calls = []
 
     async def _fake_transcribe(cl, entity, msg, engine):
@@ -616,7 +631,7 @@ async def test_prefetch_skips_cached_and_already_texted_messages(
     monkeypatch.setattr(transcription, "transcribe", _fake_transcribe)
 
     messages = [_voice_msg(id=1), _voice_msg(id=2, message="already has text")]
-    await transcription.prefetch_transcripts(None, None, 7, messages)
+    await transcription.prefetch_transcripts(None, None, 7, messages, account_id=101)
 
     assert calls == []
 
@@ -630,9 +645,11 @@ async def test_prefetch_swallows_engine_errors_without_raising(monkeypatch, tran
 
     monkeypatch.setattr(transcription, "transcribe", _boom)
 
-    await transcription.prefetch_transcripts(None, None, 7, [_voice_msg(id=5)])  # must not raise
+    await transcription.prefetch_transcripts(
+        None, None, 7, [_voice_msg(id=5)], account_id=101
+    )  # must not raise
 
-    assert transcription.get_cached_transcript(7, 5) is None
+    assert transcription.get_cached_transcript(101, 7, 5, 911) is None
 
 
 @pytest.mark.asyncio
@@ -640,9 +657,9 @@ async def test_prefetch_does_not_cache_pending_results(monkeypatch, transcript_c
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "auto")
     monkeypatch.setattr(transcription, "transcribe", _async_return({"status": "pending"}))
 
-    await transcription.prefetch_transcripts(None, None, 7, [_voice_msg(id=5)])
+    await transcription.prefetch_transcripts(None, None, 7, [_voice_msg(id=5)], account_id=101)
 
-    assert transcription.get_cached_transcript(7, 5) is None
+    assert transcription.get_cached_transcript(101, 7, 5, 911) is None
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +688,9 @@ async def test_concurrent_callers_pay_the_engine_once(transcript_cache_dir, monk
 
     results = await asyncio.gather(
         *[
-            transcription.transcribe_cached(None, None, msg, "groq", -100, duration=23)
+            transcription.transcribe_cached(
+                None, None, msg, "groq", -100, account_id=101, duration=23
+            )
             for _ in range(5)
         ]
     )
@@ -679,7 +698,9 @@ async def test_concurrent_callers_pay_the_engine_once(transcript_cache_dir, monk
     assert counter["calls"] == 1, "each concurrent caller paid the engine separately"
     assert all(r["status"] == "ok" and r["text"] == "hello" for r in results)
     assert sum(1 for r in results if not r["cached"]) == 1
-    assert transcription.get_cached_transcript(-100, 77, source="groq")["text"] == "hello"
+    assert (
+        transcription.get_cached_transcript(101, -100, 77, 911, source="groq")["text"] == "hello"
+    )
 
 
 @pytest.mark.asyncio
@@ -690,8 +711,8 @@ async def test_second_caller_after_the_first_finished_is_a_plain_cache_hit(
     monkeypatch.setattr(transcription, "transcribe", _counting_engine(counter))
     msg = _voice_msg(id=78)
 
-    first = await transcription.transcribe_cached(None, None, msg, "groq", -100)
-    second = await transcription.transcribe_cached(None, None, msg, "groq", -100)
+    first = await transcription.transcribe_cached(None, None, msg, "groq", -100, account_id=101)
+    second = await transcription.transcribe_cached(None, None, msg, "groq", -100, account_id=101)
 
     assert counter["calls"] == 1
     assert first["cached"] is False and second["cached"] is True
@@ -703,12 +724,45 @@ async def test_dedup_is_keyed_by_engine(transcript_cache_dir, monkeypatch):
     monkeypatch.setattr(transcription, "transcribe", _counting_engine(counter))
     msg = _voice_msg(id=79)
 
-    await transcription.transcribe_cached(None, None, msg, "groq", -100)
-    await transcription.transcribe_cached(None, None, msg, "telegram", -100)
+    await transcription.transcribe_cached(None, None, msg, "groq", -100, account_id=101)
+    await transcription.transcribe_cached(None, None, msg, "telegram", -100, account_id=101)
 
     # A groq request must never be answered with a telegram transcript, so the
     # two engines are two separate paid calls, not one shared one.
     assert counter["calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_transcription_is_deduplicated_per_account_and_media(
+    transcript_cache_dir, monkeypatch
+):
+    started = []
+    all_started = asyncio.Event()
+
+    async def fake_engine(cl, entity, msg, engine):
+        key = f"{cl}:{msg.voice.id}"
+        started.append(key)
+        if len(started) == 3:
+            all_started.set()
+        await all_started.wait()
+        return {"status": "ok", "text": key}
+
+    monkeypatch.setattr(transcription, "transcribe", fake_engine)
+    first = _voice_msg(id=10, voice=SimpleNamespace(id=911))
+    changed = _voice_msg(id=10, voice=SimpleNamespace(id=912))
+
+    async def run(account_id, msg):
+        return await transcription.transcribe_cached(
+            account_id, None, msg, "groq", -100, account_id=account_id
+        )
+
+    results = await asyncio.wait_for(
+        asyncio.gather(run(101, first), run(101, first), run(102, first), run(101, changed)),
+        timeout=2,
+    )
+    assert sorted(started) == ["101:911", "101:912", "102:911"]
+    assert [result["text"] for result in results] == ["101:911", "101:911", "102:911", "101:912"]
+    assert results[0]["cached"] is False and results[1]["cached"] is True
 
 
 @pytest.mark.asyncio
@@ -721,10 +775,10 @@ async def test_failed_transcription_is_not_cached_and_leaks_no_lock(
     monkeypatch.setattr(transcription, "transcribe", _failing)
     msg = _voice_msg(id=80)
 
-    result = await transcription.transcribe_cached(None, None, msg, "groq", -100)
+    result = await transcription.transcribe_cached(None, None, msg, "groq", -100, account_id=101)
 
     assert result["status"] == "error"
-    assert transcription.get_cached_transcript(-100, 80, source="groq") is None
+    assert transcription.get_cached_transcript(101, -100, 80, 911, source="groq") is None
     # The registry must not grow with every message ever attempted.
     assert transcription._INFLIGHT_LOCKS == {}
 

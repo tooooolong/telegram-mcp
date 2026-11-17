@@ -40,6 +40,7 @@ from telegram_mcp.tools.messages import (
     topics_for_messages,
     topics_metadata,
     topic_thread_kwargs,
+    transcript_account_id,
 )
 
 # chat_id -> {first_ts, last_ts, count, first_id, last_id, name, username}
@@ -663,9 +664,10 @@ async def get_messages_after(
         kind = _chat_kind(entity) or "channel"
         numeric_chat_id = get_marked_id(entity)
         forum = bool(getattr(entity, "forum", False))
+        account_id = await transcript_account_id(cl, messages)
         records = []
         for msg in messages:
-            rec = message_to_dict(msg, numeric_chat_id, forum)
+            rec = message_to_dict(msg, numeric_chat_id, forum, account_id=account_id)
             rec["date"] = _iso_utc(getattr(msg, "date", None))
             rec["out"] = bool(getattr(msg, "out", False))
             rec["mentioned"] = bool(getattr(msg, "mentioned", False))

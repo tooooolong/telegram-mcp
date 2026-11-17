@@ -76,7 +76,7 @@ from telegram_mcp.floodgate import (
     TelegramOperationSuspendedError,
     TelegramRateLimitGate,
 )
-from telegram_mcp.singleton import try_lock_exclusive
+from telegram_mcp.singleton import open_session_lock, session_lock_directory, try_lock_exclusive
 
 from functools import wraps
 import telethon.errors.rpcerrorlist
@@ -180,14 +180,14 @@ load_dotenv()
 TELEGRAM_API_ID, TELEGRAM_API_HASH = _require_api_credentials()
 
 # Install protocol compatibility for MCP 2026-07-28 and backwards compatibility
-from telegram_mcp.transport import install_protocol_compatibility
+from telegram_mcp.transport import TelegramFastMCP, install_protocol_compatibility
 
 install_protocol_compatibility()
 
 # The shared HTTP service can be consumed by long-lived MCP clients. Stateless requests keep
 # those clients usable across server-process restarts instead of rejecting their next call
 # with "No valid session ID provided". Stdio transport remains unaffected.
-mcp = FastMCP("telegram", stateless_http=True)
+mcp = TelegramFastMCP("telegram", stateless_http=True)
 
 # Annotate all tool results with audience=["user"] so MCP clients know
 # the content is user-generated data, not instructions for the model.
@@ -768,35 +768,15 @@ def _parse_session_pool() -> List[str]:
 
 def _acquire_session(pool: List[str]) -> str:
     """Claim the first free session in the pool via an advisory file lock."""
-    lock_dir = os.path.join(tempfile.gettempdir(), "telegram-mcp-session-locks")
-    try:
-        os.makedirs(lock_dir, exist_ok=True)
-    except OSError:
-        lock_dir = tempfile.gettempdir()
+    lock_dir = session_lock_directory()
     for idx, session in enumerate(pool):
         digest = hashlib.sha1(session.encode("utf-8")).hexdigest()[:16]
-        lock_path = os.path.join(lock_dir, f"session-{digest}.lock")
-        try:
-            # "a+", not "w": on Windows the lock covers the first byte, and
-            # truncating a file another live client holds is refused.
-            fh = open(lock_path, "a+")
-        except OSError:
-            continue
+        fh = open_session_lock(lock_dir / f"pool-session-{digest}.lock")
         if not try_lock_exclusive(fh):
             # Locked by another live client — try the next session.
-            try:
-                fh.close()
-            except Exception:
-                pass
+            fh.close()
             continue
         _SESSION_LOCKS.append(fh)
-        try:
-            fh.seek(0)
-            fh.truncate()
-            fh.write(f"pid={os.getpid()}\n")
-            fh.flush()
-        except OSError:
-            pass
         print(f"Using Telegram session slot {idx + 1}/{len(pool)}.", file=sys.stderr)
         return session
     # Handing out an already-claimed session here would make Telegram burn it

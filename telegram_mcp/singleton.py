@@ -37,10 +37,15 @@ from __future__ import annotations
 
 import hashlib
 import os
-import tempfile
 import time
 from pathlib import Path
 from typing import IO, Optional
+
+from telegram_mcp.private_files import (
+    create_private_file,
+    open_existing_regular,
+    prepare_lock_directory,
+)
 
 if os.name == "nt":
     import msvcrt
@@ -78,6 +83,7 @@ if os.name == "nt":
 
 else:
     import fcntl
+    import pwd
 
     _PID_OFFSET = 0
 
@@ -104,25 +110,52 @@ try_lock_exclusive = _try_lock
 release_lock = _unlock
 
 
-DEFAULT_LOCK_DIR = Path(tempfile.gettempdir()) / "telegram-mcp-locks"
 DEFAULT_GRACE_SECONDS = 20.0
 DEFAULT_POLL_INTERVAL = 0.5
 
 
 class SessionLockError(RuntimeError):
-    """Raised when a session lock isn't acquired before its grace period elapses."""
+    """Raised when a secure session lock could not be acquired."""
+
+
+def session_lock_directory(path: Optional[Path] = None) -> Path:
+    if path is None:
+        path = _account_home() / ".telegram-mcp-locks"
+    try:
+        return prepare_lock_directory(path)
+    except OSError as exc:
+        raise SessionLockError(f"Cannot use session lock directory {path}: {exc}") from exc
+
+
+def _account_home() -> Path:
+    if os.name == "nt":
+        return Path.home()
+    try:
+        return Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except KeyError as exc:
+        raise SessionLockError("Cannot locate the profile for the current OS account.") from exc
+
+
+def open_session_lock(path: Path) -> IO:
+    try:
+        try:
+            fd = create_private_file(path)
+        except FileExistsError:
+            fd = open_existing_regular(path, os.O_RDWR, private=True)
+    except OSError as exc:
+        raise SessionLockError(f"Cannot open session lock {path}: {exc}") from exc
+    return os.fdopen(fd, "r+", encoding="ascii")
 
 
 class SessionLock:
     """Exclusive, OS-released lock for one Telegram session, held for process lifetime."""
 
-    def __init__(self, label: str, session_identity: str, *, lock_dir: Path = DEFAULT_LOCK_DIR):
+    def __init__(self, label: str, session_identity: str, *, lock_dir: Optional[Path] = None):
         digest = hashlib.sha256(session_identity.encode("utf-8")).hexdigest()[:16]
-        lock_dir.mkdir(parents=True, exist_ok=True)
         # Keyed by the session alone: with the label in the name, renaming an
         # account (e.g. "default" -> "work") let an old and a new process both
         # connect the same session, each holding its own lock file.
-        self.path = lock_dir / f"session-{digest}.lock"
+        self.path = session_lock_directory(lock_dir) / f"session-{digest}.lock"
         self._fh: Optional[IO] = None
 
     def acquire(
@@ -139,7 +172,7 @@ class SessionLock:
         Raises :class:`SessionLockError` if the lock is still held once the
         grace period elapses.
         """
-        fh = open(self.path, "a+")
+        fh = open_session_lock(self.path)
         deadline = time.monotonic() + grace_seconds
         while True:
             if _try_lock(fh, shared=shared):
@@ -176,7 +209,8 @@ class SessionLock:
         Best effort: a shared holder records nothing (there may be several).
         """
         try:
-            with open(self.path, "rb") as fh:
+            fd = open_existing_regular(self.path, os.O_RDONLY, private=True)
+            with os.fdopen(fd, "rb") as fh:
                 fh.seek(_PID_OFFSET)
                 text = fh.read().decode("ascii", "replace").strip()
         except OSError:

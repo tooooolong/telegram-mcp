@@ -285,19 +285,22 @@ def _cache_db_path() -> Path:
 def _connect() -> sqlite3.Connection:
     path = _cache_db_path()
     conn = sqlite3.connect(str(path))
+    # Rows in the former transcripts table have no verifiable owner. Keep the
+    # table intact and start with a separate account-scoped cache.
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS transcripts (
+        CREATE TABLE IF NOT EXISTS account_transcripts (
+            account_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
+            media_id INTEGER NOT NULL,
             source TEXT NOT NULL,
             text TEXT NOT NULL,
             duration INTEGER,
             lang TEXT,
             created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, message_id, source)
+            PRIMARY KEY (account_id, chat_id, message_id, media_id, source)
         )
         """)
-    _migrate_source_into_key(conn)
     conn.commit()
     try:
         os.chmod(path, 0o600)
@@ -306,39 +309,8 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _migrate_source_into_key(conn: sqlite3.Connection) -> None:
-    """Older builds keyed the cache on (chat_id, message_id) alone, so a cheap
-    telegram transcript permanently shadowed the groq one - including for
-    callers that asked for groq explicitly. Rebuild such a table in place."""
-    row = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transcripts'"
-    ).fetchone()
-    if not row or not row[0]:
-        return
-    if "PRIMARY KEY (chat_id, message_id, source)" in row[0]:
-        return
-    conn.executescript("""
-        ALTER TABLE transcripts RENAME TO transcripts_legacy;
-        CREATE TABLE transcripts (
-            chat_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            source TEXT NOT NULL,
-            text TEXT NOT NULL,
-            duration INTEGER,
-            lang TEXT,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (chat_id, message_id, source)
-        );
-        INSERT OR IGNORE INTO transcripts
-            (chat_id, message_id, source, text, duration, lang, created_at)
-        SELECT chat_id, message_id, source, text, duration, lang, created_at
-        FROM transcripts_legacy;
-        DROP TABLE transcripts_legacy;
-        """)
-
-
 def get_cached_transcript(
-    chat_id: int, message_id: int, source: Optional[str] = None
+    account_id: int, chat_id: int, message_id: int, media_id: int, source: Optional[str] = None
 ) -> Optional[dict]:
     """Cached transcript for a message.
 
@@ -348,20 +320,22 @@ def get_cached_transcript(
     display whatever exists (listings, backfill skip checks) pass None and get
     the default engine's row when there is one, any row otherwise.
     """
+    key = (account_id, chat_id, message_id, media_id)
     conn = _connect()
     try:
         if source is not None:
             row = conn.execute(
-                "SELECT source, text, duration, lang, created_at FROM transcripts "
-                "WHERE chat_id = ? AND message_id = ? AND source = ?",
-                (chat_id, message_id, source),
+                "SELECT source, text, duration, lang, created_at FROM account_transcripts "
+                "WHERE account_id = ? AND chat_id = ? AND message_id = ? AND media_id = ? "
+                "AND source = ?",
+                (*key, source),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT source, text, duration, lang, created_at FROM transcripts "
-                "WHERE chat_id = ? AND message_id = ? "
+                "SELECT source, text, duration, lang, created_at FROM account_transcripts "
+                "WHERE account_id = ? AND chat_id = ? AND message_id = ? AND media_id = ? "
                 "ORDER BY source = ? DESC, created_at DESC LIMIT 1",
-                (chat_id, message_id, default_engine()),
+                (*key, default_engine()),
             ).fetchone()
     finally:
         conn.close()
@@ -378,8 +352,10 @@ def get_cached_transcript(
 
 
 def save_transcript(
+    account_id: int,
     chat_id: int,
     message_id: int,
+    media_id: int,
     source: str,
     text: str,
     *,
@@ -389,12 +365,14 @@ def save_transcript(
     conn = _connect()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO transcripts "
-            "(chat_id, message_id, source, text, duration, lang, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO account_transcripts ("
+            "account_id, chat_id, message_id, media_id, source, text, duration, lang, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
+                account_id,
                 chat_id,
                 message_id,
+                media_id,
                 source,
                 text,
                 duration,
@@ -416,6 +394,13 @@ def is_transcribable(msg) -> bool:
     """True for voice notes and video notes (video circles) - both go through
     the same engine path."""
     return getattr(msg, "voice", None) is not None or getattr(msg, "video_note", None) is not None
+
+
+def voice_media_id(msg) -> Optional[int]:
+    """Telegram document ID of the currently attached voice/video note."""
+    media = getattr(msg, "voice", None) or getattr(msg, "video_note", None)
+    media_id = getattr(media, "id", None)
+    return media_id if type(media_id) is int and media_id != 0 else None
 
 
 def voice_duration(msg) -> Optional[int]:
@@ -648,7 +633,7 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
 # transcribe_voice and the auto-mode prefetch both do "miss the cache,
 # transcribe, save". Two concurrent requests for the same uncached message
 # would both miss, both download the audio and both pay Groq for it. The lock
-# is keyed by (chat, message, engine) and the cache is re-read inside it, so
+# includes the account and media ID and the cache is re-read inside it, so
 # the second caller returns the first one's transcript without a second call.
 #
 # Scope is one process: the server is a single asyncio process over one SQLite
@@ -689,22 +674,32 @@ def _cached_result(row: dict) -> dict:
 
 
 async def transcribe_cached(
-    cl, entity, msg, engine: str, chat_id: int, duration: Optional[int] = None
+    cl,
+    entity,
+    msg,
+    engine: str,
+    chat_id: int,
+    *,
+    account_id: int,
+    duration: Optional[int] = None,
 ) -> dict:
     """Cache-first transcription, at most one paid call per recording.
 
     Same status dict as :func:`transcribe`, plus ``cached``. Every caller that
     would otherwise write to the transcript cache should go through here.
     """
-    message_id = getattr(msg, "id", None)
-    hit = get_cached_transcript(chat_id, message_id, source=engine)
+    media_id = voice_media_id(msg)
+    if media_id is None:
+        raise ValueError("A current voice or video note is required for caching.")
+    key = (account_id, chat_id, msg.id, media_id, engine)
+    hit = get_cached_transcript(*key)
     if hit is not None:
         return _cached_result(hit)
 
-    async with _transcribe_lock((chat_id, message_id, engine)):
+    async with _transcribe_lock(key):
         # Re-read: a concurrent caller may have paid for this one while we
         # were waiting for the lock.
-        hit = get_cached_transcript(chat_id, message_id, source=engine)
+        hit = get_cached_transcript(*key)
         if hit is not None:
             return _cached_result(hit)
 
@@ -713,9 +708,7 @@ async def transcribe_cached(
         result = await transcribe(cl, entity, msg, engine)
         if result.get("status") == "ok":
             save_transcript(
-                chat_id,
-                message_id,
-                engine,
+                *key,
                 result["text"],
                 duration=duration,
                 lang=result.get("lang"),
@@ -775,23 +768,26 @@ def _max_seconds_env() -> int:
         return 300
 
 
-async def prefetch_transcripts(cl, entity, chat_id: int, messages) -> None:
+async def prefetch_transcripts(
+    cl, entity, chat_id: int, messages, *, account_id: Optional[int]
+) -> None:
     """Fill the cache for cache-miss voice/video-note messages, within budget.
 
     Only called for TELEGRAM_TRANSCRIBE=auto. on-demand mode leaves cache
     misses to render as "transcript pending" - callers must invoke
     transcribe_voice explicitly to pay for them.
     """
-    if transcribe_mode() != "auto":
+    if account_id is None or transcribe_mode() != "auto":
         return
     budget = TranscribeBudget()
     engine = default_engine()
     for msg in messages:
-        if not is_transcribable(msg):
+        media_id = voice_media_id(msg)
+        if media_id is None:
             continue
         if getattr(msg, "message", None):
             continue  # already has text, nothing to fill
-        if get_cached_transcript(chat_id, msg.id) is not None:
+        if get_cached_transcript(account_id, chat_id, msg.id, media_id) is not None:
             continue
         duration = voice_duration(msg)
         if not budget.can_afford(duration):
@@ -800,7 +796,9 @@ async def prefetch_transcripts(cl, entity, chat_id: int, messages) -> None:
         try:
             # Shares the lock with transcribe_voice: a prefetch and an explicit
             # call for the same recording pay for it once between them.
-            await transcribe_cached(cl, entity, msg, engine, chat_id, duration=duration)
+            await transcribe_cached(
+                cl, entity, msg, engine, chat_id, account_id=account_id, duration=duration
+            )
         except Exception:
             continue
 
@@ -810,15 +808,17 @@ async def prefetch_transcripts(cl, entity, chat_id: int, messages) -> None:
 # ---------------------------------------------------------------------------
 
 
-def voice_attachment_info(msg, chat_id: Optional[int]) -> Optional[dict]:
+def voice_attachment_info(
+    msg, chat_id: Optional[int], *, account_id: Optional[int] = None
+) -> Optional[dict]:
     """None for non-voice-like messages. Otherwise:
     {"duration": int|None,
      "transcript": str|None, "transcript_source": str|None,
      "transcript_status": "ready"|"pending"|None}
 
-    transcript_status is None when transcription is off or no chat_id is
-    available (duration still fills in - it's free, already on the fetched
-    message). "pending" covers both "never attempted" (on-demand mode,
+    transcript_status is None when transcription is off or a cache key is
+    unavailable (duration still fills in from the fetched message).
+    "pending" covers both "never attempted" (on-demand mode,
     budget exhausted) and "attempted but Telegram is still processing" -
     callers don't need to tell those apart, both mean "call transcribe_voice
     later".
@@ -831,9 +831,12 @@ def voice_attachment_info(msg, chat_id: Optional[int]) -> Optional[dict]:
         "transcript_source": None,
         "transcript_status": None,
     }
-    if chat_id is None or transcribe_mode() == "off":
+    if account_id is None or chat_id is None or transcribe_mode() == "off":
         return info
-    cached = get_cached_transcript(chat_id, msg.id)
+    media_id = voice_media_id(msg)
+    if media_id is None:
+        return info
+    cached = get_cached_transcript(account_id, chat_id, msg.id, media_id)
     if cached is not None:
         info["transcript"] = cached["text"]
         info["transcript_source"] = cached["source"]

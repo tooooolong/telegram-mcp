@@ -15,6 +15,7 @@ from telegram_mcp.transport.protocol import (
 )
 from telegram_mcp.transport.http import (
     ProtocolNegotiationMiddleware,
+    TelegramFastMCP,
     create_streamable_http_app,
     run_streamable_http_async,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "is_supported_protocol_version",
     "negotiate_protocol_version",
     "ProtocolNegotiationMiddleware",
+    "TelegramFastMCP",
     "create_streamable_http_app",
     "run_streamable_http_async",
     "run_stdio_async",

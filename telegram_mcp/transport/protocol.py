@@ -147,13 +147,6 @@ def install_protocol_compatibility() -> None:
         logger.debug("Could not patch mcp.client.session: %s", exc)
 
     try:
-        from telegram_mcp.transport.http import patch_fastmcp_streamable_http
-
-        patch_fastmcp_streamable_http()
-    except Exception as exc:
-        logger.debug("Could not patch FastMCP streamable_http: %s", exc)
-
-    try:
         _install_silent_request_cancel()
     except (ImportError, AttributeError) as exc:
         logger.debug("Could not patch RequestResponder.cancel: %s", exc)

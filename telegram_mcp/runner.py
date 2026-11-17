@@ -26,6 +26,8 @@ from telegram_mcp.singleton import (
     SessionLockError,
     session_identity,
 )
+from telegram_mcp.transport.http import configure_transport_security, require_http_auth_token
+
 import telegram_mcp.tools  # noqa: F401 - registers MCP tools via decorators
 
 # Populated as each account's session lock is acquired; released in _main's
@@ -220,41 +222,6 @@ async def _connect_or_skip(label, client) -> None:
         )
 
 
-_LOCAL_ALLOWED_HOSTS = ("127.0.0.1:*", "localhost:*", "[::1]:*")
-_LOCAL_ALLOWED_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
-
-
-def _configure_transport_security() -> None:
-    """Always enable FastMCP's Host/Origin validation for the HTTP transports.
-
-    Without it any web page open in the user's browser could POST tool calls
-    (send, delete, forward...) to the local server: cross-origin request
-    forgery, or DNS rebinding through a hostile domain. The protection is set
-    here explicitly rather than left to FastMCP's constructor, which only turns
-    it on for the host the instance was built with, not for MCP_HOST.
-
-    By default only 127.0.0.1/localhost/[::1] Host headers and browser origins
-    are accepted. MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS replace those lists,
-    e.g. when the server sits behind a reverse proxy on a public domain.
-    """
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    raw_hosts = os.getenv("MCP_ALLOWED_HOSTS", "")
-    allowed_hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
-    raw_origins = os.getenv("MCP_ALLOWED_ORIGINS", "")
-    allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
-    if not allowed_hosts:
-        allowed_hosts = list(_LOCAL_ALLOWED_HOSTS)
-        if not allowed_origins:
-            allowed_origins = list(_LOCAL_ALLOWED_ORIGINS)
-
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=allowed_hosts,
-        allowed_origins=allowed_origins,
-    )
-
-
 async def _serve(transport: str) -> None:
     """Run the MCP server on the selected transport.
 
@@ -266,9 +233,10 @@ async def _serve(transport: str) -> None:
     "sse" is kept for clients that only support the legacy SSE transport.
     """
     if transport in ("http", "sse"):
+        require_http_auth_token()
         mcp.settings.host = os.getenv("MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.getenv("MCP_PORT", "8765"))
-        _configure_transport_security()
+        configure_transport_security(mcp)
         if transport == "http":
             await mcp.run_streamable_http_async()
         else:
@@ -280,6 +248,21 @@ async def _serve(transport: str) -> None:
 
 async def _main() -> None:
     try:
+        transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+
+        # Validate transport mode
+        VALID_TRANSPORTS = ("stdio", "http", "sse")
+        if transport not in VALID_TRANSPORTS:
+            accepted = ", ".join(VALID_TRANSPORTS)
+            print(
+                f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if transport in ("http", "sse"):
+            require_http_auth_token()
+
         labels = ", ".join(clients.keys())
         print(f"Starting {len(clients)} Telegram client(s) ({labels})...", file=sys.stderr)
         await asyncio.gather(*(_connect_or_skip(label, cl) for label, cl in list(clients.items())))
@@ -316,18 +299,6 @@ async def _main() -> None:
         catch_up_interval = _catch_up_interval()
         if catch_up_interval:
             asyncio.create_task(_periodic_catch_up(catch_up_interval))
-
-        transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-
-        # Validate transport mode
-        VALID_TRANSPORTS = ("stdio", "http", "sse")
-        if transport not in VALID_TRANSPORTS:
-            accepted = ", ".join(VALID_TRANSPORTS)
-            print(
-                f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
         # Startup log with host:port for HTTP/SSE transports
         if transport in ("http", "sse"):

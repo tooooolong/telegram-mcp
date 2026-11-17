@@ -371,9 +371,23 @@ async def test_serve_defaults_to_stdio(monkeypatch, transport):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["http", "sse"])
+async def test_serve_requires_configured_token_for_network_transports(monkeypatch, transport):
+    fake = _FakeMcp()
+    monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="MCP_AUTH_TOKEN"):
+        await runner._serve(transport)
+
+    assert fake.ran is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "sse"])
 async def test_serve_http_transports_bind_host_and_port(monkeypatch, transport):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
     monkeypatch.setenv("MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("MCP_PORT", "9000")
 
@@ -388,6 +402,7 @@ async def test_serve_http_transports_bind_host_and_port(monkeypatch, transport):
 async def test_serve_http_uses_default_host_and_port(monkeypatch):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
     monkeypatch.delenv("MCP_HOST", raising=False)
     monkeypatch.delenv("MCP_PORT", raising=False)
 
@@ -408,6 +423,7 @@ async def test_serve_http_enables_localhost_only_protection_by_default(monkeypat
     """
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
     monkeypatch.setenv("MCP_HOST", host)
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
     monkeypatch.delenv("MCP_ALLOWED_ORIGINS", raising=False)
@@ -428,6 +444,7 @@ async def test_serve_http_enables_localhost_only_protection_by_default(monkeypat
 async def test_serve_http_allowed_origins_without_hosts_replace_local_origins(monkeypatch):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
     monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "http://localhost:3000")
 
@@ -443,6 +460,7 @@ async def test_serve_http_allowed_origins_without_hosts_replace_local_origins(mo
 async def test_serve_http_configures_allowed_hosts(monkeypatch):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
     monkeypatch.setenv("MCP_ALLOWED_HOSTS", "mcp.example.com, localhost:8765")
     monkeypatch.setenv("MCP_ALLOWED_ORIGINS", "https://mcp.example.com")
 

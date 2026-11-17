@@ -1,7 +1,10 @@
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from telethon.crypto import AuthKey
+from telethon.sessions import SQLiteSession, StringSession
 
 import migrate_session
 
@@ -42,35 +45,18 @@ def test_target_paths_accepts_optional_session_suffix(tmp_path):
 async def test_migrate_copies_auth_key_verifies_and_hardens_file(tmp_path, monkeypatch):
     target = tmp_path / "telegram"
     session_file = tmp_path / "telegram.session"
-    source = SimpleNamespace(
-        dc_id=2,
-        server_address="149.154.167.40",
-        port=443,
-        auth_key=object(),
-    )
+    source = StringSession()
+    source.set_dc(2, "149.154.167.40", 443)
+    source.auth_key = AuthKey(bytes(range(256)))
     saved = {}
 
-    class FakeSQLiteSession:
-        def __init__(self, name):
-            saved["name"] = name
-            session_file.touch()
-
-        def set_dc(self, dc_id, address, port):
-            saved["dc"] = (dc_id, address, port)
-
-        def save(self):
-            saved["saved"] = True
-
-        def close(self):
-            saved["closed"] = True
-
-        @property
-        def auth_key(self):
-            return saved.get("auth_key")
-
-        @auth_key.setter
-        def auth_key(self, value):
-            saved["auth_key"] = value
+    def open_database(name):
+        path = Path(name)
+        assert path.is_file()
+        if os.name != "nt":
+            assert path.stat().st_mode & 0o777 == 0o600
+            assert path.parent.stat().st_mode & 0o777 == 0o700
+        return SQLiteSession(name)
 
     class FakeClient:
         def __init__(self, session, api_id, api_hash, **kwargs):
@@ -88,25 +74,32 @@ async def test_migrate_copies_auth_key_verifies_and_hardens_file(tmp_path, monke
         async def disconnect(self):
             saved["disconnected"] = True
 
-    monkeypatch.setattr(migrate_session, "StringSession", lambda value: source)
-    monkeypatch.setattr(migrate_session, "SQLiteSession", FakeSQLiteSession)
+    monkeypatch.setattr(migrate_session, "SQLiteSession", open_database)
     monkeypatch.setattr(migrate_session, "TelegramClient", FakeClient)
     monkeypatch.setattr(
         migrate_session, "client_identity_kwargs", lambda: {"device_model": "test"}
     )
 
-    created, user = await migrate_session.migrate("secret", 123, "hash", str(target))
+    created, user = await migrate_session.migrate(source.save(), 123, "hash", str(target))
 
     assert created == session_file.resolve()
     assert user.id == 42
-    assert saved["dc"] == (2, "149.154.167.40", 443)
-    assert saved["auth_key"] is source.auth_key
-    assert saved["saved"] is True
     assert saved["client"][1:] == (123, "hash", {"device_model": "test"})
     assert saved["connected"] is True
     assert saved["disconnected"] is True
     if os.name != "nt":  # POSIX permissions only
         assert session_file.stat().st_mode & 0o777 == 0o600
+    assert list(tmp_path.iterdir()) == [session_file]
+    persistent = SQLiteSession(str(session_file))
+    try:
+        assert (persistent.dc_id, persistent.server_address, persistent.port) == (
+            2,
+            "149.154.167.40",
+            443,
+        )
+        assert persistent.auth_key.key == source.auth_key.key
+    finally:
+        persistent.close()
 
 
 @pytest.mark.asyncio
@@ -119,14 +112,18 @@ async def test_migrate_refuses_to_overwrite_existing_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_migrate_removes_new_file_when_verification_fails(tmp_path, monkeypatch):
+@pytest.mark.parametrize("outcome", ["unauthorized", "failed_with_existing", "publish_collision"])
+async def test_migrate_cleans_failed_database_and_keeps_other_files(
+    tmp_path, monkeypatch, outcome
+):
     target = tmp_path / "telegram"
     session_file = tmp_path / "telegram.session"
     source = SimpleNamespace(dc_id=2, server_address="server", port=443, auth_key=object())
 
     class FakeSQLiteSession:
         def __init__(self, name):
-            session_file.touch()
+            path = Path(name if name.endswith(".session") else f"{name}.session")
+            path.write_bytes(b"dummy SQLite content")
 
         def set_dc(self, *args):
             return None
@@ -147,7 +144,12 @@ async def test_migrate_removes_new_file_when_verification_fails(tmp_path, monkey
             return None
 
         async def is_user_authorized(self):
-            return False
+            if outcome != "unauthorized":
+                session_file.write_bytes(b"unrelated existing file")
+            return outcome == "publish_collision"
+
+        async def get_me(self):
+            return SimpleNamespace(id=42)
 
         async def disconnect(self):
             return None
@@ -156,10 +158,15 @@ async def test_migrate_removes_new_file_when_verification_fails(tmp_path, monkey
     monkeypatch.setattr(migrate_session, "SQLiteSession", FakeSQLiteSession)
     monkeypatch.setattr(migrate_session, "TelegramClient", FakeClient)
 
-    with pytest.raises(RuntimeError, match="not authorized"):
+    error = FileExistsError if outcome == "publish_collision" else RuntimeError
+    with pytest.raises(error):
         await migrate_session.migrate("secret", 123, "hash", str(target))
 
-    assert not session_file.exists()
+    if outcome != "unauthorized":
+        assert list(tmp_path.iterdir()) == [session_file]
+        assert session_file.read_bytes() == b"unrelated existing file"
+    else:
+        assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.asyncio

@@ -189,7 +189,7 @@ async def test_invite_does_not_expose_blocked_chat(monkeypatch, tool_name):
     class Client:
         async def __call__(self, request):
             requests.append(request)
-            return SimpleNamespace(chat=chat)
+            return types.ChatInviteAlready(chat=chat)
 
     async def connected(client):
         pass

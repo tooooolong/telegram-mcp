@@ -523,6 +523,10 @@ async def test_search_global_drops_other_topics_of_a_limited_chat(monkeypatch):
         msg.chat = forum
 
     class GlobalClient:
+        async def get_me(self, *, input_peer):
+            assert input_peer
+            return types.InputPeerUser(51, 0)
+
         async def __call__(self, request):
             return types.messages.Messages(messages=found, chats=[forum], users=[], topics=[])
 

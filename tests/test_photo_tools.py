@@ -172,7 +172,7 @@ async def test_open_photo_reports_a_missing_identifier_instead_of_raising(patche
 
 
 @pytest.mark.asyncio
-async def test_open_photo_save_path_keeps_a_copy_inside_allowed_roots(patched_media, tmp_path):
+async def test_save_photo_keeps_a_copy_inside_allowed_roots(patched_media, tmp_path):
     root = (tmp_path / "root").resolve()
     root.mkdir()
     patched_media.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root])
@@ -185,14 +185,14 @@ async def test_open_photo_save_path_keeps_a_copy_inside_allowed_roots(patched_me
         media, "download_photo_bytes", lambda cl, ref, thumbnail=False: _async(_jpeg_bytes())
     )
 
-    result = await media.open_photo("example_user", save_path="kept.jpg")
+    result = await media.save_photo("example_user", save_path="kept.jpg")
 
-    assert isinstance(result, Image)
+    assert "kept.jpg" in result
     assert (root / "kept.jpg").read_bytes() == _jpeg_bytes()
 
 
 @pytest.mark.asyncio
-async def test_open_photo_refuses_a_save_path_outside_allowed_roots(patched_media, tmp_path):
+async def test_save_photo_refuses_a_save_path_outside_allowed_roots(patched_media, tmp_path):
     root = (tmp_path / "root").resolve()
     root.mkdir()
     patched_media.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root])
@@ -205,9 +205,30 @@ async def test_open_photo_refuses_a_save_path_outside_allowed_roots(patched_medi
         media, "download_photo_bytes", lambda cl, ref, thumbnail=False: _async(_jpeg_bytes())
     )
 
-    result = await media.open_photo("example_user", save_path=str(tmp_path / "outside.jpg"))
+    result = await media.save_photo("example_user", save_path=str(tmp_path / "outside.jpg"))
 
     assert "outside allowed roots" in result
+
+
+@pytest.mark.asyncio
+async def test_save_photo_refuses_to_overwrite_existing_file(patched_media, tmp_path):
+    root = tmp_path.resolve()
+    (root / "kept.jpg").write_bytes(b"existing")
+    patched_media.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root])
+    patched_media.setattr(media, "find_photo_reference", lambda *_: _async(_reference(200)))
+    patched_media.setattr(media, "download_photo_bytes", lambda *_: _async(_jpeg_bytes()))
+
+    result = await media.save_photo("example_user", save_path="kept.jpg")
+
+    assert "already exists" in result
+    assert (root / "kept.jpg").read_bytes() == b"existing"
+
+
+def test_photo_read_and_write_tools_have_distinct_schemas_and_hints():
+    registered = {tool.name: tool for tool in runtime.mcp._tool_manager.list_tools()}
+    assert "save_path" not in registered["open_photo"].parameters["properties"]
+    assert registered["save_photo"].annotations.readOnlyHint is False
+    assert "save_path" in registered["save_photo"].parameters["required"]
 
 
 @pytest.mark.asyncio
