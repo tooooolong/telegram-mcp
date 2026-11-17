@@ -8,9 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.shared.context import RequestContext
 from mcp.shared.exceptions import McpError
 from mcp.types import ErrorData, ToolAnnotations
+from starlette.requests import Request
 from telethon.tl.types import Channel, Chat, PeerUser, User
 
 import main
@@ -1652,6 +1654,43 @@ class _RootsSessionThatMustNotBeCalled:
     async def list_roots(self):
         self.calls += 1
         await asyncio.sleep(3600)
+
+
+@pytest.mark.parametrize("endpoint", ["/messages/", "/mcp"])
+@pytest.mark.parametrize("has_server_root", [True, False])
+@pytest.mark.asyncio
+async def test_network_file_tools_use_server_roots_only(
+    endpoint, has_server_root, tmp_path, monkeypatch
+):
+    root = tmp_path / "server"
+    root.mkdir()
+    file = root / "example.txt"
+    file.write_text("sample", encoding="utf-8")
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [root] if has_server_root else [])
+    monkeypatch.delenv("TELEGRAM_SERVER_ROOTS_ONLY", raising=False)
+    session = _RootsSessionThatMustNotBeCalled()
+    ctx = Context(
+        request_context=RequestContext(
+            request_id=1,
+            meta=None,
+            session=session,
+            lifespan_context=None,
+            request=Request({"type": "http", "method": "POST", "path": endpoint}),
+        )
+    )
+
+    resolved, error = await asyncio.wait_for(
+        runtime._resolve_readable_file_path(
+            raw_path="example.txt", ctx=ctx, tool_name="send_file"
+        ),
+        timeout=1,
+    )
+    if has_server_root:
+        assert (resolved, error) == (file.resolve(), None)
+    else:
+        assert resolved is None
+        assert "TELEGRAM_ALLOWED_ROOTS" in error
+    assert session.calls == 0
 
 
 def test_server_roots_only_enabled_parsing(monkeypatch):

@@ -3098,6 +3098,15 @@ async def _get_effective_allowed_roots_with_status(
     if fallback_roots and _server_roots_only_enabled():
         return fallback_roots, ROOTS_STATUS_SERVER_ONLY
 
+    # Both network transports attach a server-side request to the SDK context.
+    # In-process calls outside a request can still use the server's own roots.
+    try:
+        request_context = getattr(ctx, "request_context", None)
+    except ValueError:
+        return fallback_roots, ROOTS_STATUS_SERVER_ONLY
+    if getattr(request_context, "request", None) is not None:
+        return fallback_roots, ROOTS_STATUS_SERVER_ONLY
+
     try:
         timeout = _roots_request_timeout()
         if timeout is None:
@@ -3164,6 +3173,12 @@ async def _ensure_allowed_roots(
 ) -> tuple[List[Path], Optional[str]]:
     roots, status = await _get_effective_allowed_roots_with_status(ctx)
     if not roots:
+        if status == ROOTS_STATUS_SERVER_ONLY:
+            return (
+                [],
+                f"{tool_name} is disabled until server allowed roots are configured. "
+                "Set TELEGRAM_ALLOWED_ROOTS or pass server CLI roots.",
+            )
         if status == ROOTS_STATUS_CLIENT_DENY_ALL:
             return (
                 [],

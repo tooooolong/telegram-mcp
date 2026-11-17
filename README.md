@@ -774,12 +774,14 @@ a time- and memory-limited subprocess. Other hosts can preview text and images.
 Allowed roots can come from:
 
 - **Environment Variable (`TELEGRAM_ALLOWED_ROOTS`):** Semicolon- (`;`) or comma- (`,`) separated paths (also supports colon `:` on POSIX systems). Ideal for Docker, headless daemon setups, and MCP clients that pass settings via environment.
-- **Server CLI arguments:** Positional folder paths passed to `main.py`, used as a server-side fallback.
-- **MCP client Roots:** Configured directly in supported MCP clients (`roots/list`).
+- **Server CLI arguments:** Positional folder paths passed to `main.py`.
+- **MCP client Roots (stdio):** Configured directly in supported local MCP clients (`roots/list`).
 
 Security behavior:
 
-- Client MCP Roots replace server CLI roots when available.
+- HTTP and SSE file tools use only server roots. Configure at least one server
+  root to enable them. Those transports never issue `roots/list`.
+- For stdio, client MCP Roots replace server roots when available.
 - Some clients (notably Cursor) return workspace roots as bare absolute paths
   instead of `file://` URIs. That breaks MCP SDK validation of `list_roots`;
   the server recovers those absolute paths from the validation error so
@@ -790,7 +792,7 @@ Security behavior:
   `TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1` to fall back to the server CLI roots
   in that case (opt-in; the default stays deny-all). The same opt-in also applies
   when `list_roots` fails unexpectedly and no client paths could be recovered.
-- `roots/list` times out after `TELEGRAM_ROOTS_TIMEOUT_SECONDS` (default 10).
+- For stdio, `roots/list` times out after `TELEGRAM_ROOTS_TIMEOUT_SECONDS` (default 10).
   With server roots configured, `TELEGRAM_SERVER_ROOTS_ONLY=1` uses them directly
   and skips `roots/list`; client Roots are then ignored.
 - Paths are resolved through real paths and must stay inside an allowed root.
@@ -819,8 +821,8 @@ Both URLs carry an HMAC signature and stay inside the first server allowed root.
 The signature authorizes the individual transfer without an MCP bearer header.
 Each expires after an hour or when the server restarts, and an upload URL takes
 one upload. Uploads land in `<first_root>/uploads/` and are deleted two hours
-later. Client MCP Roots name the client's own disk, so such a deployment
-usually also sets `TELEGRAM_SERVER_ROOTS_ONLY=1`.
+later. Configure the remote service's file roots with `TELEGRAM_ALLOWED_ROOTS`
+or server CLI arguments.
 
 Run with allowed roots via environment variable:
 
@@ -1079,7 +1081,7 @@ Telegram messages, display names, chat titles, and button labels are untrusted c
 - **Database is locked:** make sure no other process is using the same file session.
 - **`AuthKeyDuplicatedError` / "Another telegram-mcp process is already connected with this session":** two processes tried to connect the same Telegram session at once (e.g. an MCP client restarted the connector before the old process exited), which Telegram rejects and can invalidate the session for both. The server now takes an exclusive lock per session before connecting; a second concurrent launch waits briefly (default 20s, override with `TELEGRAM_LOCK_GRACE_SECONDS`) for the first to release it and otherwise exits without ever calling `connect()`, instead of racing into a duplicate connection. Retry once only one instance is running — the refusal names the PID holding the lock. If several instances on this host are meant to share one session (all reaching Telegram from the same IP), set `TELEGRAM_SESSION_LOCK=shared`; see [Sharing one session from one host](#sharing-one-session-from-one-host).
 - **File tools are disabled:** pass allowed roots or configure MCP Roots in your client.
-- **File tools wait for `roots/list`:** configure server roots and set `TELEGRAM_SERVER_ROOTS_ONLY=1`.
+- **stdio file tools wait for `roots/list`:** configure server roots and set `TELEGRAM_SERVER_ROOTS_ONLY=1`.
 - **Path rejected:** ensure the path is inside an allowed root and does not use traversal or wildcard patterns.
 - **Auth errors after password changes:** regenerate your session string.
 - **Bot-only tool rejected:** regular user accounts cannot manage bot command settings.
