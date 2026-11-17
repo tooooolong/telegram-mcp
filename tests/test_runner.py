@@ -70,6 +70,13 @@ def _isolate_session_locks(tmp_path, monkeypatch):
     # load_dotenv() may have pulled TELEGRAM_SESSION_LOCK from the developer's
     # .env; tests assume the exclusive default unless they set it themselves.
     monkeypatch.delenv("TELEGRAM_SESSION_LOCK", raising=False)
+    monkeypatch.setattr(runner, "_service_configured", False)
+    monkeypatch.setattr(
+        runtime_module, "SERVER_ALLOWED_ROOTS", runtime_module.SERVER_ALLOWED_ROOTS
+    )
+    monkeypatch.setattr(
+        runtime_module, "EXTENSION_ALLOWLISTS", runtime_module.EXTENSION_ALLOWLISTS
+    )
     yield
     runner._session_locks.clear()
 
@@ -280,20 +287,12 @@ async def test_shared_and_exclusive_instances_never_overlap(monkeypatch, first_m
     first_lock.release()
 
 
-def test_invalid_transport_exits_with_error(monkeypatch, capsys):
-    """An unknown MCP_TRANSPORT causes the validation in _main to print an error and exit."""
+@pytest.mark.asyncio
+async def test_invalid_transport_exits_with_error(monkeypatch, capsys):
     monkeypatch.setenv("MCP_TRANSPORT", "ftp")
 
     with pytest.raises(SystemExit) as excinfo:
-        transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-        VALID_TRANSPORTS = ("stdio", "http", "sse")
-        if transport not in VALID_TRANSPORTS:
-            accepted = ", ".join(VALID_TRANSPORTS)
-            print(
-                f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        await runner._main()
 
     assert excinfo.value.code == 1
     captured = capsys.readouterr()
@@ -359,14 +358,26 @@ class _FakeMcp:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["stdio", "unknown"])
-async def test_serve_defaults_to_stdio(monkeypatch, transport):
+async def test_serve_stdio(monkeypatch):
     fake = _FakeMcp()
     monkeypatch.setattr(runner, "mcp", fake)
 
-    await runner._serve(transport)
+    await runner._serve("stdio")
 
     assert fake.ran == "stdio"
+
+
+@pytest.mark.asyncio
+async def test_embedded_serve_rejects_unknown_transport(monkeypatch):
+    from telegram_mcp import server
+
+    fake = _FakeMcp()
+    monkeypatch.setattr(runner, "mcp", fake)
+
+    with pytest.raises(ValueError, match="Invalid MCP_TRANSPORT"):
+        await server.serve("unknown")
+
+    assert fake.ran is None
 
 
 @pytest.mark.asyncio
@@ -538,31 +549,6 @@ def test_cli_transport_flag_overrides_env_var(monkeypatch):
     assert runtime._CLI_TRANSPORT == "stdio"
 
 
-def test_invalid_transport_env_exits_with_error(monkeypatch, capsys):
-    """_main validates MCP_TRANSPORT before calling _serve; unknown values print an error."""
-    # Directly test the validation branch without standing up the full async stack.
-    # The validation reads os.environ["MCP_TRANSPORT"] and calls sys.exit(1) synchronously
-    # via sys.exit inside the async try block — we verify the message is correct.
-    import io
-
-    bad_transport = "ftp"
-    err_buf = io.StringIO()
-
-    # Replicate the exact validation from _main() so we can unit-test it in isolation
-    VALID_TRANSPORTS = ("stdio", "http", "sse")
-    transport = bad_transport
-    if transport not in VALID_TRANSPORTS:
-        accepted = ", ".join(VALID_TRANSPORTS)
-        msg = f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}."
-        print(msg, file=err_buf)
-
-    output = err_buf.getvalue()
-    assert bad_transport in output
-    assert "stdio" in output
-    assert "http" in output
-    assert "sse" in output
-
-
 def test_cli_host_and_port_flags(monkeypatch):
     """--host and --port populate _CLI_HOST and _CLI_PORT in runtime."""
     from telegram_mcp import runtime
@@ -721,8 +707,8 @@ async def test_main_serves_labelled_accounts_when_preset_default_is_not_logged_i
     served = []
 
     async def fake_serve(transport):
-        await asyncio.sleep(0)  # let the background cache warm-up run
-        served.append(transport)
+        async with runtime_module.mcp.service_lifespan():
+            served.append(transport)
 
     monkeypatch.setattr(runner, "clients", accounts)
     monkeypatch.setattr(runtime_module, "OPTIONAL_ACCOUNTS", {"default"})
@@ -736,6 +722,36 @@ async def test_main_serves_labelled_accounts_when_preset_default_is_not_logged_i
     assert list(accounts) == ["work"]
     assert "Skipping account 'default'" in err
     assert "Telegram client(s) started (work)." in err
+
+
+@pytest.mark.asyncio
+async def test_embedded_stdio_starts_and_releases_the_same_sessions(monkeypatch):
+    from mcp.server.fastmcp import FastMCP
+    from telegram_mcp import server
+    from telegram_mcp.tools import events
+
+    account = _DialogsClient(authorized=True, identity="work-session")
+    monkeypatch.setattr(runner, "clients", {"work": account})
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USERNAME_WORK", "work_account")
+    monkeypatch.setattr(events, "_feed_task", None)
+    feed_task = None
+
+    async def fake_stdio(self):
+        nonlocal feed_task
+        assert self is runtime_module.mcp
+        assert account.get_me_calls == 1
+        assert "work" in runner._session_locks
+        assert not account.disconnected
+        feed_task = asyncio.create_task(asyncio.sleep(3600))
+        events._feed_task = feed_task
+
+    monkeypatch.setattr(FastMCP, "run_stdio_async", fake_stdio)
+    await server.serve("stdio")
+
+    assert account.disconnected
+    assert not runner._session_locks
+    assert feed_task.cancelled()
+    assert not events.feed_enabled()
 
 
 @pytest.mark.parametrize(

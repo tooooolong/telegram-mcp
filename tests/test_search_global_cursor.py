@@ -193,14 +193,46 @@ async def test_endless_empty_messages_end_the_search(server):
 
 
 @pytest.mark.asyncio
-async def test_allowlist_shortens_a_page_but_not_the_cursor(server, monkeypatch):
+async def test_scoped_search_pages_by_visible_matches(server, monkeypatch):
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", str(FRIEND.id))
-    first = json.loads(await messages.search_global("отчёт", page_size=100))
-    assert first["results"] == [] and first["exhausted"] is False
-    second = json.loads(
-        await messages.search_global("отчёт", page_size=100, cursor=first["next_cursor"])
+    second_message = types.Message(
+        id=2, peer_id=types.PeerUser(FRIEND.id), date=NOW, message="next"
     )
-    assert [(r["chat_id"], r["id"]) for r in second["results"]] == [(FRIEND.id, 3)]
+    hidden_posts = [m for m in server.results if isinstance(m.peer_id, types.PeerChannel)]
+    server.results = (
+        hidden_posts[:2] + [server.results[100]] + hidden_posts[2:5] + [second_message]
+    )
+
+    first = json.loads(await messages.search_global("отчёт", page_size=1))
+    assert [(r["chat_id"], r["id"]) for r in first["results"]] == [(FRIEND.id, 3)]
+    assert first["exhausted"] is False
+    second = json.loads(
+        await messages.search_global("отчёт", page_size=1, cursor=first["next_cursor"])
+    )
+    assert [(r["chat_id"], r["id"]) for r in second["results"]] == [(FRIEND.id, 2)]
+    assert second["next_cursor"] is None and second["exhausted"] is True
+    assert ids(await messages.search_global("отчёт", page=2, page_size=1)) == [(FRIEND.id, 2)]
+
+
+@pytest.mark.asyncio
+async def test_scoped_no_match_has_same_response_with_or_without_hidden_hits(server, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", str(FRIEND.id))
+    server.results = server.results[:100]
+    hidden = await messages.search_global("отчёт")
+    server.results = []
+    absent = await messages.search_global("отчёт")
+
+    assert hidden == absent == "No messages found for this page."
+
+
+@pytest.mark.asyncio
+async def test_scoped_small_page_searches_full_telegram_batches(server, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", str(FRIEND.id))
+
+    result = await messages.search_global("отчёт", page_size=1)
+
+    assert ids(result) == [(FRIEND.id, 3)]
+    assert all(request.limit == messages.SEARCH_GLOBAL_CHUNK for request in server.requests)
 
 
 @pytest.mark.asyncio
@@ -235,13 +267,17 @@ async def test_cursor_is_invalidated_by_privacy_policy_changes(
 ):
     if previous is not None:
         monkeypatch.setenv(env, previous)
+        for result in server.results[:2]:
+            result.reply_to = types.MessageReplyHeader(forum_topic=True, reply_to_msg_id=2)
     first = json.loads(await messages.search_global("отчёт", page_size=1))
+    assert first["next_cursor"] is not None
+    request_count = len(server.requests)
     monkeypatch.setenv(env, current)
 
     result = await messages.search_global("отчёт", cursor=first["next_cursor"])
 
     assert "restart the search" in result.lower()
-    assert len(server.requests) == 1
+    assert len(server.requests) == request_count
 
 
 @pytest.mark.asyncio
@@ -295,13 +331,13 @@ async def test_rejects_bad_paging_before_any_request(server, kwargs):
 
 
 @pytest.mark.asyncio
-async def test_blocked_chat_is_filtered_and_cursor_still_pages(server, monkeypatch):
+async def test_hidden_tail_does_not_produce_a_cursor(server, monkeypatch):
     monkeypatch.setenv("TELEGRAM_BLOCKED_CHAT_IDS", str(messages.utils.get_peer_id(CHANNEL)))
-    first = json.loads(await messages.search_global("отчёт", page_size=1))
-    assert first["results"] == []
-    cursor = first["next_cursor"]
-    # A fresh client can resume using the cursor.
-    monkeypatch.setattr(messages, "get_client", lambda account=None: GlobalSearchServer())
-    second = json.loads(await messages.search_global("отчёт", page_size=1, cursor=cursor))
-    assert second["results"] == []
-    assert len(server.requests) == 1
+    server.results = [server.results[100]] + server.results[:5]
+    result_with_hidden_tail = json.loads(await messages.search_global("отчёт", page_size=1))
+    server.results = server.results[:1]
+    result_without_hidden_tail = json.loads(await messages.search_global("отчёт", page_size=1))
+
+    assert result_with_hidden_tail == result_without_hidden_tail
+    assert result_with_hidden_tail["next_cursor"] is None
+    assert result_with_hidden_tail["exhausted"] is True

@@ -30,7 +30,7 @@ services:
       # layer and is lost on every `docker compose build`. It holds plaintext
       # personal-chat transcripts, so this directory should get its own
       # backup/retention policy rather than riding along with a general backup.
-      # Host directory must be readable/writable by uid 1000 (appuser):
-      #   mkdir -p ./transcript_cache && chown 1000:1000 ./transcript_cache
+      # Host directory must be private to uid 1000 (appuser):
+      #   mkdir -p ./transcript_cache && chmod 700 ./transcript_cache && chown 1000:1000 ./transcript_cache
       - ./transcript_cache:/app/data/transcripts
     restart: unless-stopped

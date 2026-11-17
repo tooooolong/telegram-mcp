@@ -51,7 +51,7 @@ COPY telegram_mcp ./telegram_mcp
 
 # Create non-root user and setup directories
 RUN adduser --disabled-password --gecos "" appuser && \
-    mkdir -p /app/data/transcripts && \
+    mkdir -p -m 0700 /app/data/transcripts && \
     chown -R appuser:appuser /app
 
 USER appuser

@@ -8,6 +8,7 @@ except UnsafeInstallationError as exc:
     raise SystemExit(str(exc)) from None
 
 import sys
+from contextlib import asynccontextmanager
 from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError
 
 # Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
@@ -29,10 +30,10 @@ from telegram_mcp.singleton import (
 from telegram_mcp.transport.http import configure_transport_security, require_http_auth_token
 
 import telegram_mcp.tools  # noqa: F401 - registers MCP tools via decorators
+from telegram_mcp.tools.events import stop_incoming_feed
 
-# Populated as each account's session lock is acquired; released in _main's
-# finally block so a lock is never held past this process's lifetime.
 _session_locks: dict[str, SessionLock] = {}
+_service_configured = False
 
 
 def _lock_grace_seconds() -> float:
@@ -152,9 +153,18 @@ async def _connect_authorized_client(label, client) -> None:
     # on this host; TELEGRAM_SESSION_LOCK=shared lets those share one session
     # where they all reach Telegram from a single IP.
     lock = SessionLock(label, session_identity(client))
-    await asyncio.to_thread(
-        lock.acquire, grace_seconds=_lock_grace_seconds(), shared=_session_lock_shared()
+    acquire = asyncio.create_task(
+        asyncio.to_thread(
+            lock.acquire, grace_seconds=_lock_grace_seconds(), shared=_session_lock_shared()
+        )
     )
+    try:
+        await asyncio.shield(acquire)
+    except asyncio.CancelledError:
+        # The thread can acquire the lock after startup has been cancelled.
+        await asyncio.gather(acquire, return_exceptions=True)
+        lock.release()
+        raise
     _session_locks[label] = lock
 
     # Once we hold the lock, still tolerate a transient AuthKeyDuplicatedError
@@ -207,12 +217,13 @@ async def _connect_or_skip(label, client) -> None:
         if label not in _runtime.OPTIONAL_ACCOUNTS:
             raise
         lock = _session_locks.pop(label, None)
-        if lock is not None:
-            lock.release()
         try:
             await client.disconnect()
         except Exception:
             pass
+        finally:
+            if lock is not None:
+                lock.release()
         clients.pop(label, None)
         print(
             f"Skipping account '{label}': TELEGRAM_SESSION_NAME names a session that is not "
@@ -232,6 +243,10 @@ async def _serve(transport: str) -> None:
     that Claude Code (`--transport http`) and Codex (`--url`) speak natively;
     "sse" is kept for clients that only support the legacy SSE transport.
     """
+    valid_transports = ("stdio", "http", "sse")
+    if transport not in valid_transports:
+        accepted = ", ".join(valid_transports)
+        raise ValueError(f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.")
     if transport in ("http", "sse"):
         require_http_auth_token()
         mcp.settings.host = os.getenv("MCP_HOST", "127.0.0.1")
@@ -246,76 +261,56 @@ async def _serve(transport: str) -> None:
         await mcp.run_stdio_async()
 
 
-async def _main() -> None:
-    try:
-        transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-
-        # Validate transport mode
-        VALID_TRANSPORTS = ("stdio", "http", "sse")
-        if transport not in VALID_TRANSPORTS:
-            accepted = ", ".join(VALID_TRANSPORTS)
+async def _warm_caches() -> None:
+    async def warm_client(label: str, client) -> None:
+        try:
+            await client.get_dialogs()
+        except BotMethodInvalidError:
             print(
-                f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.",
+                f"Skipping entity cache pre-warm for bot client '{label}' "
+                "(dialogs restricted for bots).",
                 file=sys.stderr,
             )
-            sys.exit(1)
+        except Exception as exc:
+            print(f"Entity cache warm failed for '{label}': {exc}", file=sys.stderr)
 
-        if transport in ("http", "sse"):
-            require_http_auth_token()
+    await asyncio.gather(*(warm_client(label, cl) for label, cl in list(clients.items())))
+    print("Entity caches warmed.", file=sys.stderr)
 
+
+@asynccontextmanager
+async def _service_lifespan():
+    _prepare_service_configuration()
+    accounts = list(clients.items())
+    labels = ", ".join(label for label, _ in accounts)
+    print(f"Starting {len(accounts)} Telegram client(s) ({labels})...", file=sys.stderr)
+    tasks = [asyncio.create_task(_connect_or_skip(label, cl)) for label, cl in accounts]
+    try:
+        await asyncio.gather(*tasks)
         labels = ", ".join(clients.keys())
-        print(f"Starting {len(clients)} Telegram client(s) ({labels})...", file=sys.stderr)
-        await asyncio.gather(*(_connect_or_skip(label, cl) for label, cl in list(clients.items())))
-        labels = ", ".join(clients.keys())
-
-        # Warm entity caches — StringSession has no persistent cache,
-        # so fetch all dialogs once per client to populate them.
-        # Runs in background: blocking startup on this (e.g. under a
-        # GetDialogsRequest flood wait) makes MCP clients time out, and
-        # resolve_entity() re-warms the cache on miss anyway.
-        print("Warming entity caches (background)...", file=sys.stderr)
-
-        async def _warm_caches() -> None:
-            async def _warm_client(label: str, cl: TelegramClient) -> None:
-                try:
-                    await cl.get_dialogs()
-                except BotMethodInvalidError:
-                    print(
-                        f"Skipping entity cache pre-warm for bot client "
-                        f"'{label}' (dialogs restricted for bots).",
-                        file=sys.stderr,
-                    )
-                except Exception as exc:
-                    print(f"Entity cache warm failed for '{label}': {exc}", file=sys.stderr)
-
-            try:
-                await asyncio.gather(*(_warm_client(label, cl) for label, cl in clients.items()))
-                print("Entity caches warmed.", file=sys.stderr)
-            except Exception as warm_exc:
-                print(f"Entity cache warm failed: {warm_exc}", file=sys.stderr)
-
-        asyncio.create_task(_warm_caches())
-
+        print(f"Telegram client(s) started ({labels}).", file=sys.stderr)
+        # Cache warming may need more time than the MCP client's startup timeout.
+        tasks.append(asyncio.create_task(_warm_caches()))
         catch_up_interval = _catch_up_interval()
         if catch_up_interval:
-            asyncio.create_task(_periodic_catch_up(catch_up_interval))
+            tasks.append(asyncio.create_task(_periodic_catch_up(catch_up_interval)))
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*(cl.disconnect() for _, cl in accounts), return_exceptions=True)
+            await stop_incoming_feed()
+        finally:
+            for lock in _session_locks.values():
+                lock.release()
+            _session_locks.clear()
 
-        # Startup log with host:port for HTTP/SSE transports
-        if transport in ("http", "sse"):
-            host = os.getenv("MCP_HOST", "127.0.0.1")
-            port = os.getenv("MCP_PORT", "8765")
-            print(
-                f"Telegram client(s) started ({labels}). Running MCP server "
-                f"({transport}) on {host}:{port}...",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"Telegram client(s) started ({labels}). Running MCP server ({transport})...",
-                file=sys.stderr,
-            )
 
-        await _serve(transport)
+async def _main() -> None:
+    try:
+        await _serve(os.getenv("MCP_TRANSPORT", "stdio").lower())
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
@@ -336,31 +331,16 @@ async def _main() -> None:
                 file=sys.stderr,
             )
         sys.exit(1)
-    finally:
-        try:
-            await asyncio.gather(
-                *(cl.disconnect() for cl in clients.values()), return_exceptions=True
-            )
-        except Exception:
-            pass
-        for lock in _session_locks.values():
-            lock.release()
-        _session_locks.clear()
 
 
-def main() -> None:
-    _configure_allowed_roots_from_cli(sys.argv[1:])
-    # Apply CLI transport/host/port overrides to environment (runtime sets globals)
-    transport = _runtime._CLI_TRANSPORT or "stdio"
-    host = _runtime._CLI_HOST
-    port = _runtime._CLI_PORT
+def _prepare_service_configuration(argv=None) -> None:
+    global _service_configured
+    if _service_configured:
+        return
+    _configure_allowed_roots_from_cli(argv)
+    _transcription.validate_transcription_config()
+    _session_lock_shared()
 
-    if transport != "stdio":
-        os.environ["MCP_TRANSPORT"] = transport
-    if host:
-        os.environ["MCP_HOST"] = host
-    if port is not None:
-        os.environ["MCP_PORT"] = str(port)
     # Before _apply_exposed_tools_mode(): that prunes non-exposed tools from
     # the tool manager, and the extension overrides validate tool names
     # against that same manager. Narrowing send_file's extensions while
@@ -382,8 +362,22 @@ def main() -> None:
             f"after '-': {', '.join(sorted(excluded))}",
             file=sys.stderr,
         )
-    _transcription.validate_transcription_config()
-    _session_lock_shared()  # fail loudly at startup on a bad toggle
+    _service_configured = True
+
+
+def main() -> None:
+    _prepare_service_configuration(sys.argv[1:])
+    # Apply CLI transport/host/port overrides to environment (runtime sets globals).
+    transport = _runtime._CLI_TRANSPORT or "stdio"
+    host = _runtime._CLI_HOST
+    port = _runtime._CLI_PORT
+
+    if transport != "stdio":
+        os.environ["MCP_TRANSPORT"] = transport
+    if host:
+        os.environ["MCP_HOST"] = host
+    if port is not None:
+        os.environ["MCP_PORT"] = str(port)
     asyncio.run(_main())
 
 

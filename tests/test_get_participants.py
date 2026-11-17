@@ -1,6 +1,7 @@
 """Participant pagination and failure signaling through the real MCP handler."""
 
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,12 @@ def client(monkeypatch, tmp_path):
         selected.connections += 1
 
     monkeypatch.setattr(groups, "ensure_connected", connected)
+
+    @asynccontextmanager
+    async def test_lifespan():
+        yield
+
+    monkeypatch.setattr(runtime.mcp, "_service_lifespan", test_lifespan)
     return client
 
 
@@ -61,7 +68,8 @@ async def call_participants(**arguments):
         params=CallToolRequestParams(name="get_participants", arguments=arguments),
     )
     handler = runtime.mcp._mcp_server.request_handlers[CallToolRequest]
-    return (await handler(request)).root
+    async with runtime.mcp.service_lifespan():
+        return (await handler(request)).root
 
 
 def text(result):

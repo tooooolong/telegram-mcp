@@ -39,7 +39,7 @@ from pythonjsonlogger.json import JsonFormatter
 from telethon import TelegramClient, functions, types, utils
 from telethon.errors import AuthKeyDuplicatedError, FloodWaitError, BotMethodInvalidError, RPCError
 from telethon.errors.rpcerrorlist import rpc_errors_dict
-from telethon.sessions import StringSession
+from telethon.sessions import MemorySession, StringSession
 from telethon.tl.tlobject import TLObject
 from telethon.tl.types import (
     User,
@@ -70,6 +70,7 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
 from telegram_mcp.account_labels import canonical_account_label
+from telegram_mcp.media_links import DOWNLOAD_SUBDIR, TRANSFER_SUBDIR
 from telegram_mcp.floodgate import (
     FloodCircuitBreaker,
     RateLimitSpec,
@@ -77,6 +78,7 @@ from telegram_mcp.floodgate import (
     TelegramRateLimitGate,
 )
 from telegram_mcp.singleton import open_session_lock, session_lock_directory, try_lock_exclusive
+from telegram_mcp.private_sqlite import prepare_private_sqlite_file
 
 from functools import wraps
 import telethon.errors.rpcerrorlist
@@ -184,10 +186,17 @@ from telegram_mcp.transport import TelegramFastMCP, install_protocol_compatibili
 
 install_protocol_compatibility()
 
+
+def _telegram_service_lifespan():
+    from telegram_mcp.runner import _service_lifespan
+
+    return _service_lifespan()
+
+
 # The shared HTTP service can be consumed by long-lived MCP clients. Stateless requests keep
 # those clients usable across server-process restarts instead of rejecting their next call
 # with "No valid session ID provided". Stdio transport remains unaffected.
-mcp = TelegramFastMCP("telegram", stateless_http=True)
+mcp = TelegramFastMCP("telegram", stateless_http=True, service_lifespan=_telegram_service_lifespan)
 
 # Annotate all tool results with audience=["user"] so MCP clients know
 # the content is user-generated data, not instructions for the model.
@@ -553,6 +562,10 @@ def _apply_file_extension_overrides(
     """
     global EXTENSION_ALLOWLISTS
     overrides = _get_file_extension_overrides(value)
+    if "preview_custom_emoji" in overrides:
+        raise SystemExit(
+            "TELEGRAM_FILE_EXTENSIONS: use save_custom_emoji for custom emoji file saves."
+        )
     if overrides:
         registered = {tool.name for tool in server._tool_manager.list_tools()}
         unknown = sorted(set(overrides) - registered)
@@ -718,10 +731,23 @@ def _resolve_session_path(session_name: str) -> str:
     return session_name
 
 
+def _file_session(session_name: str) -> Union[str, MemorySession]:
+    if session_name == ":memory:":
+        return MemorySession()
+    path = _resolve_session_path(session_name)
+    if not path.endswith(".session"):
+        path += ".session"
+    try:
+        return str(prepare_private_sqlite_file(Path(path)))
+    except OSError as error:
+        raise SystemExit(
+            f"Cannot open private Telegram session {path}: {error}. "
+            "Use an owner-only session file in a trusted directory or TELEGRAM_SESSION_STRING."
+        ) from error
+
+
 def _build_client(session: Any, label: str) -> TelegramClient:
     """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
-    if isinstance(session, str):
-        session = _resolve_session_path(session)
     proxy, connection = _build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
     if proxy is not None:
@@ -823,7 +849,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
             accounts[label] = _build_client(StringSession(value), label)
         elif key.startswith(prefix_name) and value:
             label = canonical_account_label(key[len(prefix_name) :])
-            accounts[label] = _build_client(_resolve_session_path(value), label)
+            accounts[label] = _build_client(_file_session(value), label)
 
     # Backward-compatible unsuffixed variables. A pool (TELEGRAM_SESSION_STRINGS)
     # takes precedence for the default account and claims a free session slot.
@@ -839,7 +865,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_string:
             accounts["default"] = _build_client(StringSession(session_string), "default")
         elif session_name:
-            accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
+            accounts["default"] = _build_client(_file_session(session_name), "default")
             if len(accounts) > 1:
                 # The Docker image and .env.example preset TELEGRAM_SESSION_NAME, so next to
                 # labelled accounts it often names a session nobody logged in to. The runner
@@ -1332,7 +1358,7 @@ _DEFAULT_EXTENSION_ALLOWLISTS: dict[str, set[str]] = {
     "send_sticker": {".webp"},
     "set_profile_photo": {".jpg", ".jpeg", ".png", ".webp"},
     "edit_chat_photo": {".jpg", ".jpeg", ".png", ".webp"},
-    "preview_custom_emoji": {".webp", ".png", ".jpg", ".jpeg", ".tgs", ".webm"},
+    "save_custom_emoji": {".webp", ".png", ".jpg", ".jpeg", ".tgs", ".webm"},
 }
 # Mutable, TELEGRAM_FILE_EXTENSIONS-aware allowlist actually consulted by
 # _ensure_extension_allowed(). Rebuilt from _DEFAULT_EXTENSION_ALLOWLISTS by
@@ -1349,7 +1375,7 @@ MAX_FILE_BYTES: dict[str, int] = {
     "send_sticker": 10 * 1024 * 1024,
     "set_profile_photo": 50 * 1024 * 1024,
     "edit_chat_photo": 50 * 1024 * 1024,
-    "preview_custom_emoji": 20 * 1024 * 1024,
+    "save_custom_emoji": 20 * 1024 * 1024,
 }
 ROOTS_UNSUPPORTED_ERROR_CODES = {-32601}
 ROOTS_STATUS_READY = "ready"
@@ -3241,6 +3267,10 @@ async def _resolve_readable_file_path(
 
     if not _path_is_within_any_root(candidate, roots):
         return None, "Path is outside allowed roots."
+    if SERVER_ALLOWED_ROOTS and candidate.is_relative_to(
+        SERVER_ALLOWED_ROOTS[0] / TRANSFER_SUBDIR / DOWNLOAD_SUBDIR
+    ):
+        return None, "Use the signed download URL to read the transfer copy."
     if not candidate.is_file():
         return None, f"Path is not a file: {candidate}"
     if not os.access(candidate, os.R_OK):
@@ -3293,6 +3323,10 @@ async def _resolve_writable_file_path(
         parent, roots
     ):
         return None, "Path is outside allowed roots."
+    if SERVER_ALLOWED_ROOTS and candidate.is_relative_to(
+        SERVER_ALLOWED_ROOTS[0] / TRANSFER_SUBDIR
+    ):
+        return None, "This directory is reserved for signed media transfers."
 
     extension_error = _ensure_extension_allowed(tool_name, candidate)
     if extension_error:

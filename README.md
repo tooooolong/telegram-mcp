@@ -133,7 +133,7 @@ Aliases live in `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/aliases.json` (o
 - `groq` (default): uploads the recording to Groq's hosted `whisper-large-v3-turbo`. Leaves the server and costs a download+upload per call, but doesn't drop the recording's last few words the way native transcription does. Requires `GROQ_API_KEY`. Groq caps the size of a single upload, so a recording above `TELEGRAM_TRANSCRIBE_GROQ_MAX_MB` (default 25, the free-tier limit) is refused locally with a `too_large` error naming its size instead of being downloaded and rejected by the API. Raise the limit if your Groq tier allows bigger files, or transcribe that message with `engine='telegram'`, which has no such cap.
 - `telegram`: native Telegram Premium transcription (`messages.TranscribeAudioRequest`). Free and never leaves Telegram, but empirically drops the last speech segment in roughly 2 of 3 recordings and requires Telegram Premium on the account. Long recordings come back `pending` and are polled automatically.
 - `openai`: any OpenAI-compatible `/audio/transcriptions` endpoint — OpenAI itself, a self-hosted [Parakeet](https://github.com/achetronic/parakeet) or [speaches](https://github.com/speaches-ai/speaches) server, LocalAI, a vLLM Whisper deployment, and so on. Set `TELEGRAM_TRANSCRIBE_OPENAI_URL` to the API base URL (e.g. `https://api.openai.com/v1`; a full `.../audio/transcriptions` URL also works), `TELEGRAM_TRANSCRIBE_OPENAI_API_KEY` for the bearer token (optional for keyless local servers), and `TELEGRAM_TRANSCRIBE_OPENAI_MODEL` (default `whisper-1`). Size cap: `TELEGRAM_TRANSCRIBE_OPENAI_MAX_MB` (default 25). For Parakeet use `TELEGRAM_TRANSCRIBE_OPENAI_URL=http://localhost:5092/v1`, the API key only if the server sets `PARAKEET_API_KEY`, and set `TELEGRAM_TRANSCRIBE_LANGUAGE` for anything that isn't English — Parakeet assumes `en` when no language is sent.
-- `whisper`: a local [faster-whisper](https://github.com/SYSTRAN/faster-whisper) model loaded inside the MCP server process. The audio never leaves the machine. Install the extra with `pip install "telegram-mcp[whisper] @ git+https://github.com/chigwell/telegram-mcp.git@<tag-or-commit>"` (or `uv sync --extra whisper`). `TELEGRAM_TRANSCRIBE_WHISPER_MODEL` picks the model (default `small`; e.g. `large-v3-turbo` for better quality), `TELEGRAM_TRANSCRIBE_WHISPER_DEVICE` (`auto`/`cpu`/`cuda`), `TELEGRAM_TRANSCRIBE_WHISPER_COMPUTE_TYPE` (e.g. `int8` on CPU) and `TELEGRAM_TRANSCRIBE_WHISPER_MODEL_DIR` (where models are downloaded) tune it. The model is loaded once on first use and recordings are transcribed one at a time. Not available in the Alpine Docker image; use `openai` against a Parakeet or other OpenAI-compatible server next to the container instead.
+- `whisper`: on Linux, runs [faster-whisper](https://github.com/SYSTRAN/faster-whisper) in a fresh subprocess for each recording. Audio stays on the machine. Install the `whisper` extra in a supported environment. `TELEGRAM_TRANSCRIBE_WHISPER_MODEL` selects the model (default `small`). `TELEGRAM_TRANSCRIBE_WHISPER_DEVICE`, `TELEGRAM_TRANSCRIBE_WHISPER_COMPUTE_TYPE` and `TELEGRAM_TRANSCRIBE_WHISPER_MODEL_DIR` control the device, precision and model cache. Each process loads the selected model from the model cache, or downloads that model on initial use. One request at a time may download and process a recording, up to 25 MiB, 300 seconds of decoded audio and a 120-second processing deadline. The general tool deadline may end the request sooner. Use another engine in the Alpine image or on macOS and Windows.
 
 `TELEGRAM_TRANSCRIBE_LANGUAGE` (ISO-639-1, e.g. `nl`) is passed as a language hint to every engine except `telegram`; unset, the engines auto-detect. `TELEGRAM_TRANSCRIBE_TIMEOUT` (default 120 seconds) bounds a single request to the HTTP engines (`groq`, `openai`).
 
@@ -145,7 +145,7 @@ The engine defaults to `TELEGRAM_TRANSCRIBE_ENGINE` and can be overridden per ca
 - `on-demand` (default): listings show cached transcripts but never spend an API call fetching a new one.
 - `auto`: `get_history`, `get_messages`, `list_messages`, and `search_messages` also prefetch missing transcripts, bounded per call by `TELEGRAM_TRANSCRIBE_MAX_VOICES`/`TELEGRAM_TRANSCRIBE_MAX_SECONDS` (Groq isn't free, so this prefetch is budgeted rather than unbounded).
 
-The cache lives in `TELEGRAM_TRANSCRIPT_CACHE_DIR` (default `data/transcripts` in the working directory, or `~/.cache/telegram-mcp/transcripts` when that is not writable), written as a 700 directory / 600 file since it holds personal-chat text in plaintext — see [Docker](#docker) for why this needs its own volume mount in a container.
+The cache holds personal-chat text in plaintext in `TELEGRAM_TRANSCRIPT_CACHE_DIR`. It defaults to `data/transcripts` in the working directory, with `~/.cache/telegram-mcp/transcripts` available when the default cannot be created. On POSIX the cache directory and database are created with permissions `0700` and `0600`, respectively. Existing cache directories, databases and SQLite sidecars must be private to the server user before use. On Windows, persistent transcription is unavailable because the server cannot verify the cache ACL. Message listings still show voice notes if the cache is unavailable. See [Docker](#docker) for volume configuration.
 - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
 - **Folders and drafts:** list, create, update, reorder, and delete Telegram folders; preview a shared folder invite (`t.me/addlist/...`) without joining it; save, list, and clear drafts.
   - `get_folder_limits` reports current Premium-aware folder, explicit-chat and pin limits from Telegram app config; unavailable limits are `null`.
@@ -182,6 +182,11 @@ or `edit_message`, and insert `<tg-emoji emoji-id="ID">EMOJI</tg-emoji>` using i
 the entry above becomes `<tg-emoji emoji-id="5368324170671202286">🍷</tg-emoji>`.
 Telegram's account restrictions still apply to sending custom emoji.
 
+`preview_custom_emoji` returns an image to the client. Use `save_custom_emoji`
+to create a new file under an allowed root. Update any
+`TELEGRAM_FILE_EXTENSIONS` entry for `preview_custom_emoji` to name
+`save_custom_emoji`.
+
 For plain-text messages, pass the entries themselves as `custom_emojis` instead,
 with no HTML and no escaping; the text is sent verbatim. For example,
 `send_message(chat_id, "🍷 News for List<int> & co", custom_emojis=[{"emoji": "🍷",
@@ -211,14 +216,18 @@ format_date="13/09 13:00")` sends a message whose date opens that menu.
 
 ### Incoming Event Feed (callback mode, Claude Code only)
 
-By default, an agent waits for replies by calling `wait_for_settled_message`, which blocks up to the MCP tool timeout and must be re-called — that works everywhere (Codex, Cursor, etc.) and is unchanged.
+An agent can wait for replies with `wait_for_settled_message`, which blocks up to
+the MCP tool timeout. Both debounce tools accept `account` to limit the wait to
+one configured account. Omit it to wait across accounts. With multiple
+accounts, resolving a chat by username requires specifying the account. Each
+result names the source account for the burst or pending chat.
 
 Clients that can wake an agent on external output (Claude Code's persistent `Monitor` on `tail -f`) can switch to callback mode instead:
 
 1. The agent calls `enable_incoming_feed` (or set `TELEGRAM_EVENT_FEED=1` in the environment to auto-enable). Each settled incoming burst is appended as one JSON line to `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/incoming_feed.jsonl`, created owner-only (0600). Override the path with `TELEGRAM_EVENT_FEED_FILE` — an explicit path's directory must already exist. `incoming_feed_status` reports the effective path and a ready-to-use watch command.
 2. The agent arms a persistent Monitor with the `watch_command` returned by the tool. Every new line re-invokes the agent with the burst summary; no blocking tool call is held open, and the chat stays free.
 
-`disable_incoming_feed` switches back; `incoming_feed_status` reports the current mode. While the feed is enabled it consumes settled bursts, so don't combine it with `wait_for_settled_message`. Feed lines contain user-generated `name` fields — treat them as untrusted data.
+`disable_incoming_feed` switches back; `incoming_feed_status` reports the current mode. While the feed is enabled it consumes settled bursts, so don't combine it with `wait_for_settled_message`. Each feed line includes the source `account`. Use that account and `chat_id` together when following up. Feed lines contain user-generated `name` fields — treat them as untrusted data.
 
 ### Per-message events (chat bridges)
 
@@ -333,6 +342,11 @@ This reads `TELEGRAM_SESSION_STRING_WORK` and writes the corresponding
 `TELEGRAM_SESSION_NAME_WORK` instruction. Use `--target PATH` to choose another
 destination. Do not run the migration while another process is using the source
 session.
+
+On POSIX, file sessions and SQLite companion files must be owner-only and
+their directory must be protected from writes by other users. Restrict the
+permissions on existing session files before starting the server. On Windows,
+use a string session.
 
 By default, all Telegram MCP tools are exposed. If you want to prevent MCP
 clients from sending messages or performing chat/account mutations, set
@@ -606,6 +620,17 @@ codex mcp add telegram --url http://127.0.0.1:8765/mcp \
 
 For clients that cannot send HTTP headers, use the stdio configuration.
 
+When embedding the server, run the ASGI lifespan of `get_http_app()` or the
+application returned by `get_server().streamable_http_app()` or
+`get_server().sse_app()`. For a mounted app, enter `async with app.lifespan()`
+in the parent application's lifespan. Startup applies the same tool and file
+settings as the CLI, acquires the session locks and verifies the Telegram
+accounts. For direct calls on the FastMCP instance, enter
+`async with get_server().service_lifespan()` before calling tools. Only one
+transport lifespan can be active per instance. Build a fresh application when
+restarting Streamable HTTP. Keep the same event loop when reusing a server
+instance, and restart the process to change startup settings.
+
 ## Multi-Account Setup
 
 Use suffixed session variables to configure multiple Telegram accounts:
@@ -817,12 +842,19 @@ proxy) and configure a server allowed root:
   `send_file` size limit), then pass `file_path` to `send_file`, `send_album`,
   `send_voice` or `send_sticker`.
 
-Both URLs carry an HMAC signature and stay inside the first server allowed root.
-The signature authorizes the individual transfer without an MCP bearer header.
-Each expires after an hour or when the server restarts, and an upload URL takes
-one upload. Uploads land in `<first_root>/uploads/` and are deleted two hours
-later. Configure the remote service's file roots with `TELEGRAM_ALLOWED_ROOTS`
-or server CLI arguments.
+Both URLs carry a signature that authorizes the individual transfer without an
+MCP bearer header. A download URL serves a private copy of that transfer, even
+when the original output path is reused. An upload URL accepts one upload.
+Each link expires after an hour or when the server restarts.
+
+Signed transfers require POSIX ownership and permissions. Configure the first
+server root on Linux or macOS under directories writable only by trusted local
+users. The service keeps a private `.telegram-mcp-transfers` directory there.
+When preparing a new transfer, it cleans its own slots of that type after two
+hours of inactivity. Each transfer type can hold up to 64 slots. Ordinary file
+tools can read completed uploads via their
+returned `file_path`. Existing files under the old `uploads/` directory are
+left in place.
 
 Run with allowed roots via environment variable:
 
@@ -878,6 +910,7 @@ When `TELEGRAM_ALLOWED_CHAT_IDS` is set:
 - **Messaging & Chat Tools (`send_message`, `get_messages`, `get_chat`, `create_poll`, etc.):** Any attempt to interact with a chat outside the allowlist is rejected with a structured error message: `Access to chat '<chat_id>' is restricted by privacy policy (TELEGRAM_ALLOWED_CHAT_IDS)`.
 - **Search, Drafts & Calls (`search_global`, `get_drafts`, `list_calls`):** Global searches, draft listings and the call list omit unallowed conversations.
 - **Contact, folder & group-admin tools:** a chat named by `contact_id` or `group_id` (`get_last_interaction`, `get_contact_chats`, `invite_to_group`, `promote_admin`, `demote_admin`) is checked like `chat_id`; `get_common_chats`, `get_contact_chats`, `get_direct_chat_by_contact` and `get_folder` leave unallowed chats out of their results; `create_folder` refuses unallowed `chat_ids`.
+- **Standalone contact and privacy changes:** `add_contact`, `delete_contact`, `block_user`, `unblock_user` and `set_privacy_settings` check the resolved user. When either chat list is configured, phone-only contact imports are disabled. Use `add_contact` with an allowed Telegram username.
 - **Incoming Events:** Notifications and debounce feeds only process events from allowed chats.
 - **Invite links:** `join_chat_by_link` and `import_chat_invite` require Telegram to identify an allowed whole chat before joining. Some invite previews omit the chat ID, so those links are refused while the allowlist is enabled.
 
@@ -911,9 +944,10 @@ TELEGRAM_BLOCKED_CHAT_IDS=-100123456789,-4567,12345678,@unwanted_bot
 
 The blocklist takes precedence over `TELEGRAM_ALLOWED_CHAT_IDS` for data returned
 to the agent. Messages from blocked chats are filtered from results and events;
-forwarding messages from those chats is also blocked. Other actions are not
-restricted by the blocklist. A bot's username blocks its own chat, not messages it
-posts elsewhere.
+forwarding messages from those chats is also blocked. Standalone contact and
+privacy changes require a permitted user. Other actions retain their existing
+blocklist behavior. A bot's username blocks its own chat, not messages it posts
+elsewhere.
 IDs are exact, including the `-` or `-100` prefix; usernames are case-insensitive.
 Prefer numeric IDs for reliable blocking: usernames can change, and chats whose
 username cannot be checked may still appear in results. Existing export files are
@@ -981,7 +1015,7 @@ living in the container's writable layer. Create it once, owned by the
 container's `appuser` (uid 1000), before starting:
 
 ```bash
-mkdir -p ./transcript_cache && chown 1000:1000 ./transcript_cache
+mkdir -p ./transcript_cache && chmod 700 ./transcript_cache && chown 1000:1000 ./transcript_cache
 ```
 
 ### One container per client (stdio)

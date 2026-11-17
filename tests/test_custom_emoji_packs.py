@@ -11,6 +11,7 @@ from mcp.server.fastmcp import Context, Image
 from telethon import functions, types
 from telethon.errors.rpcerrorlist import StickersetInvalidError
 
+from telegram_mcp import runtime
 from telegram_mcp.runtime import mcp
 from telegram_mcp.tools import custom_emoji, stickers
 from telegram_mcp.tools.custom_emoji import (
@@ -18,11 +19,13 @@ from telegram_mcp.tools.custom_emoji import (
     get_custom_emoji_pack,
     get_custom_emoji_packs,
     preview_custom_emoji,
+    save_custom_emoji,
 )
 
 _get_custom_emoji_packs = inspect.unwrap(get_custom_emoji_packs)
 _get_custom_emoji_pack = inspect.unwrap(get_custom_emoji_pack)
 _preview_custom_emoji = inspect.unwrap(preview_custom_emoji)
+_save_custom_emoji = inspect.unwrap(save_custom_emoji)
 
 EMOJI_DOC_ID = 5368324170671202286
 PACK_ID = 987654321
@@ -96,6 +99,8 @@ def test_tools_are_registered_and_read_only():
     assert registered["get_custom_emoji_packs"].annotations.readOnlyHint is True
     assert registered["get_custom_emoji_pack"].annotations.readOnlyHint is True
     assert registered["preview_custom_emoji"].annotations.readOnlyHint is True
+    assert "save_path" not in registered["preview_custom_emoji"].parameters["properties"]
+    assert registered["save_custom_emoji"].annotations.readOnlyHint is False
 
 
 def test_stickers_alias_exports():
@@ -344,7 +349,7 @@ async def test_preview_custom_emoji_webp_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_preview_custom_emoji_with_save_path(monkeypatch, tmp_path):
+async def test_save_custom_emoji_writes_new_file(monkeypatch, tmp_path):
     cl = AsyncMock()
     doc = _mock_custom_emoji_doc(doc_id=888)
     cl.return_value = [doc]
@@ -362,15 +367,13 @@ async def test_preview_custom_emoji_with_save_path(monkeypatch, tmp_path):
         AsyncMock(return_value=(target_file, None)),
     )
 
-    result = await _preview_custom_emoji(888, save_path=str(target_file))
-    assert isinstance(result, list)
-    assert f"Custom emoji 888 saved to {target_file}" in result[0]
-    assert isinstance(result[1], Image)
+    result = await _save_custom_emoji(888, save_path=str(target_file))
+    assert f"Custom emoji 888 saved to {target_file}" in result
     assert target_file.read_bytes() == png_bytes
 
 
 @pytest.mark.asyncio
-async def test_preview_custom_emoji_creates_parent_directories_if_missing(monkeypatch, tmp_path):
+async def test_save_custom_emoji_creates_parent_directories(monkeypatch, tmp_path):
     cl = AsyncMock()
     doc = _mock_custom_emoji_doc(doc_id=999)
     cl.return_value = [doc]
@@ -384,15 +387,15 @@ async def test_preview_custom_emoji_creates_parent_directories_if_missing(monkey
 
     monkeypatch.setattr(custom_emoji, "get_client", lambda account=None: cl)
     monkeypatch.setattr(custom_emoji, "ensure_connected", AsyncMock())
-    monkeypatch.setattr(
-        custom_emoji,
-        "_resolve_writable_file_path",
-        AsyncMock(return_value=(target_file, None)),
-    )
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [tmp_path.resolve()])
 
-    result = await _preview_custom_emoji(999, save_path=str(target_file))
-    assert isinstance(result, list)
+    result = await _save_custom_emoji(999, save_path=str(target_file))
+    assert "Custom emoji 999 saved" in result
     assert target_file.exists()
+    assert target_file.read_bytes() == png_bytes
+
+    repeated = await _save_custom_emoji(999, save_path=str(target_file))
+    assert "already exists" in repeated
     assert target_file.read_bytes() == png_bytes
 
 
@@ -412,7 +415,7 @@ async def test_preview_custom_emoji_animated_tgs_guidance(monkeypatch):
     result = await _preview_custom_emoji(111, thumbnail=False)
     assert isinstance(result, str)
     assert "cannot be rendered as a static image without thumbnail" in result
-    assert "Please call with thumbnail=True or provide save_path" in result
+    assert "Please call with thumbnail=True or use save_custom_emoji" in result
 
 
 def test_extract_pack_short_name_query_and_edge_cases():

@@ -2,7 +2,7 @@
 
 Lets agents react to new client messages instead of polling. A Telethon
 NewMessage(incoming=True) handler records incoming private (non-bot, non-self)
-messages per chat; the two tools below expose them, with wait_for_settled_message
+messages per account and chat. The two tools below expose them, with wait_for_settled_message
 debouncing a burst (several messages typed in a row) into a single settled event.
 
 Separately, a per-message event log serves long-running integrators such as chat
@@ -22,6 +22,7 @@ import stat
 import time
 import logging
 from collections import deque
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -43,8 +44,8 @@ from telegram_mcp.tools.messages import (
     transcript_account_id,
 )
 
-# chat_id -> {first_ts, last_ts, count, first_id, last_id, name, username}
-_pending_msgs: Dict[int, Dict[str, Any]] = {}
+_BurstKey = tuple[str, int]
+_pending_msgs: Dict[_BurstKey, Dict[str, Any]] = {}
 _activity_event: Optional[asyncio.Event] = None
 
 # --- Incoming event feed (callback mode) ---
@@ -66,27 +67,30 @@ def _get_activity_event() -> asyncio.Event:
     return _activity_event
 
 
+def _pending_for(account: Optional[str], chat_id: Optional[int]):
+    restricted = is_chat_allowlist_enabled() or is_chat_blocklist_enabled()
+    for key, rec in _pending_msgs.items():
+        label, cid = key
+        if account is not None and label != account:
+            continue
+        if chat_id is not None and cid != chat_id:
+            continue
+        if not restricted or is_chat_allowed(cid):
+            yield key, rec
+
+
 def _scan_settled(
-    now: float, settle: float, only: Optional[int] = None
-) -> Tuple[Optional[int], Optional[float]]:
+    now: float, settle: float, *, account: Optional[str] = None, chat_id: Optional[int] = None
+) -> Tuple[Optional[_BurstKey], Optional[float]]:
     """Find a chat whose burst has been quiet for `settle` seconds.
 
-    Returns (settled_chat_id, seconds_until_soonest_chat_settles). The second
-    value is None when nothing is pending; the first is None when no chat has
-    settled yet. With `only` set, every other chat is ignored — waiting for one
-    person must not be interrupted by unrelated conversations.
+    Returns the settled account and chat key, or the time until the next burst settles.
     """
     soonest_remaining = None
-    for cid, rec in list(_pending_msgs.items()):
-        if (is_chat_allowlist_enabled() or is_chat_blocklist_enabled()) and not is_chat_allowed(
-            cid
-        ):
-            continue
-        if only is not None and cid != only:
-            continue
+    for key, rec in _pending_for(account, chat_id):
         quiet = now - rec["last_ts"]
         if quiet >= settle:
-            return cid, None
+            return key, None
         rem = settle - quiet
         if soonest_remaining is None or rem < soonest_remaining:
             soonest_remaining = rem
@@ -104,11 +108,19 @@ async def _wait_target(chat_id, account=None) -> Optional[int]:
     return get_marked_id(entity)
 
 
-def _burst_summary(chat_id: int, rec: Dict[str, Any]) -> Dict[str, Any]:
+def _wait_account(account: Optional[str]) -> Optional[str]:
+    if account is None:
+        return None
+    get_client(account)
+    return canonical_account_label(account)
+
+
+def _burst_summary(key: _BurstKey, rec: Dict[str, Any]) -> Dict[str, Any]:
     """Settled-burst record shared by wait_for_settled_message and the feed."""
     return {
         "event": True,
-        "chat_id": chat_id,
+        "account": key[0],
+        "chat_id": key[1],
         "name": sanitize_name(rec["name"]),
         "username": rec["username"],
         "message_count": rec["count"],
@@ -173,10 +185,10 @@ async def _feed_loop(settle_ms: int) -> None:
     ev = _get_activity_event()
     while True:
         try:
-            settled_cid, soonest_remaining = _scan_settled(time.monotonic(), settle)
-            if settled_cid is not None:
-                rec = _pending_msgs[settled_cid]
-                line = dict(_burst_summary(settled_cid, rec), ts=round(time.time(), 2))
+            settled_key, soonest_remaining = _scan_settled(time.monotonic(), settle)
+            if settled_key is not None:
+                rec = _pending_msgs[settled_key]
+                line = dict(_burst_summary(settled_key, rec), ts=round(time.time(), 2))
                 del line["event"]
                 # ponytail: append-only file; rotate it manually (tail -F survives rotation)
                 with _open_feed_append() as f:
@@ -184,7 +196,7 @@ async def _feed_loop(settle_ms: int) -> None:
                 # Pop only after a successful write (no await in between, so no
                 # consumer can observe the burst twice); a write failure retries
                 # the same burst on the next iteration instead of dropping it.
-                _pending_msgs.pop(settled_cid, None)
+                _pending_msgs.pop(settled_key, None)
                 continue
             if soonest_remaining is not None:
                 await asyncio.sleep(soonest_remaining)
@@ -207,6 +219,14 @@ def _start_feed(settle_ms: int) -> None:
     _feed_task = asyncio.get_running_loop().create_task(_feed_loop(settle_ms))
 
 
+async def stop_incoming_feed() -> None:
+    global _feed_task
+    task, _feed_task = _feed_task, None
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def _maybe_autostart_feed() -> None:
     """Start the feed on first incoming event if TELEGRAM_EVENT_FEED is truthy.
 
@@ -225,7 +245,7 @@ def _maybe_autostart_feed() -> None:
         _start_feed(_feed_settle_ms)
 
 
-async def _on_new_incoming(event) -> None:
+async def _on_new_incoming(event, *, account: str) -> None:
     """Record incoming private (non-bot, non-self) messages for the debounce tools."""
     try:
         if not event.is_private:
@@ -242,9 +262,10 @@ async def _on_new_incoming(event) -> None:
             return
         now = time.monotonic()
         msg_id = event.message.id
-        rec = _pending_msgs.get(chat_id)
+        key = (account, chat_id)
+        rec = _pending_msgs.get(key)
         if rec is None:
-            _pending_msgs[chat_id] = {
+            _pending_msgs[key] = {
                 "first_ts": now,
                 "last_ts": now,
                 "count": 1,
@@ -709,7 +730,9 @@ def register_incoming_handlers() -> None:
     """
     for label, cl in clients.items():
         try:
-            cl.add_event_handler(_on_new_incoming, _events.NewMessage(incoming=True))
+            cl.add_event_handler(
+                partial(_on_new_incoming, account=label), _events.NewMessage(incoming=True)
+            )
             cl.add_event_handler(_message_event_handler(label), _events.NewMessage())
         except Exception:
             logging.getLogger("telegram_mcp").error("Failed to register incoming handler")
@@ -745,32 +768,27 @@ async def wait_for_new_message(
             any unrelated conversation wakes the call and you burn turns on
             messages you are not waiting for. Other chats keep accumulating and
             are still there when you ask for them.
+        account: Only this account's events. If omitted, includes all accounts.
+            Each pending chat names its source account.
     """
     try:
-        target = await _wait_target(chat_id, account)
+        label = _wait_account(account)
+        target = await _wait_target(chat_id, label)
         ev = _get_activity_event()
         deadline = time.monotonic() + timeout
         while True:
-            pending = {
-                cid: rec
-                for cid, rec in _pending_msgs.items()
-                if (target is None or cid == target)
-                and (
-                    not (is_chat_allowlist_enabled() or is_chat_blocklist_enabled())
-                    or is_chat_allowed(cid)
-                )
-            }
-            if pending:
-                chats = [
-                    {
-                        "chat_id": cid,
-                        "name": sanitize_name(rec["name"]),
-                        "username": rec["username"],
-                        "count": rec["count"],
-                        "last_message_id": rec["last_id"],
-                    }
-                    for cid, rec in pending.items()
-                ]
+            chats = [
+                {
+                    "account": source,
+                    "chat_id": cid,
+                    "name": sanitize_name(rec["name"]),
+                    "username": rec["username"],
+                    "count": rec["count"],
+                    "last_message_id": rec["last_id"],
+                }
+                for (source, cid), rec in _pending_for(label, target)
+            ]
+            if chats:
                 return json.dumps({"event": True, "pending_chats": chats}, ensure_ascii=False)
 
             remaining = deadline - time.monotonic()
@@ -826,18 +844,23 @@ async def wait_for_settled_message(
             other conversation wakes the call, wastes a turn, and tempts you into
             sleep-polling. Bursts from other chats stay pending and are returned by
             later unfiltered calls.
+        account: Only consume bursts from this account. If omitted, the next
+            settled burst may come from any account. The result names its source.
     """
     try:
-        target = await _wait_target(chat_id, account)
+        label = _wait_account(account)
+        target = await _wait_target(chat_id, label)
         settle = settle_ms / 1000.0
         deadline = time.monotonic() + max_wait_ms / 1000.0
         ev = _get_activity_event()
         while True:
             now = time.monotonic()
-            settled_cid, soonest_remaining = _scan_settled(now, settle, only=target)
-            if settled_cid is not None:
-                rec = _pending_msgs.pop(settled_cid)
-                return json.dumps(_burst_summary(settled_cid, rec), ensure_ascii=False)
+            settled_key, soonest_remaining = _scan_settled(
+                now, settle, account=label, chat_id=target
+            )
+            if settled_key is not None:
+                rec = _pending_msgs.pop(settled_key)
+                return json.dumps(_burst_summary(settled_key, rec), ensure_ascii=False)
             remaining_total = deadline - now
             if remaining_total <= 0:
                 return json.dumps(
@@ -908,11 +931,9 @@ async def enable_incoming_feed(settle_ms: int = 6000) -> str:
 async def disable_incoming_feed() -> str:
     """Disable the incoming event feed (stops writing to the feed file)."""
     try:
-        global _feed_task
         if not feed_enabled():
             return "Incoming feed is not enabled."
-        _feed_task.cancel()
-        _feed_task = None
+        await stop_incoming_feed()
         return "Incoming feed disabled."
     except Exception as e:
         return log_and_format_error("disable_incoming_feed", e)

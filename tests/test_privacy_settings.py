@@ -96,6 +96,39 @@ async def test_unknown_user_changes_nothing(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "value"),
+    [("TELEGRAM_ALLOWED_CHAT_IDS", "999"), ("TELEGRAM_BLOCKED_CHAT_IDS", "@ivan_k")],
+)
+async def test_scoped_privacy_changes_require_every_resolved_user(monkeypatch, policy, value):
+    client = install(monkeypatch, [types.PrivacyValueDisallowAll()])
+    monkeypatch.setenv(policy, value)
+
+    result = await profile.set_privacy_settings(key="phone", allow_users=["@ivan_k"])
+
+    assert result == "Error: Could not find a requested user; privacy settings were not changed."
+    assert client.sent == []
+
+
+@pytest.mark.asyncio
+async def test_privacy_changes_keep_unmentioned_exceptions_under_chat_policy(monkeypatch):
+    client = install(
+        monkeypatch,
+        [types.PrivacyValueAllowUsers(users=[MOM.id]), types.PrivacyValueDisallowAll()],
+    )
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", str(IVAN.id))
+
+    result = await profile.set_privacy_settings(key="status", disallow_users=[101])
+
+    assert result == "Privacy settings for status updated successfully."
+    assert client.sent[0].rules == [
+        types.InputPrivacyValueAllowUsers(users=[MOM_INPUT]),
+        types.InputPrivacyValueDisallowUsers(users=[IVAN_INPUT]),
+        types.InputPrivacyValueDisallowAll(),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_without_users_nothing_is_sent(monkeypatch):
     client = install(monkeypatch, [types.PrivacyValueDisallowAll()])
 

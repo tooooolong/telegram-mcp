@@ -1,11 +1,12 @@
 """Unit tests for resolve_username tool and normalize_username helper."""
 
 import json
-from types import SimpleNamespace
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 from telethon import functions, types
+from telethon.errors import UsernameNotOccupiedError
 
 from telegram_mcp.tools import chats
 from telegram_mcp.tools.chats import normalize_username, resolve_username
@@ -25,7 +26,7 @@ def test_normalize_username_variants():
 
 @pytest.mark.asyncio
 async def test_resolve_username_user_success(monkeypatch):
-    mock_user = SimpleNamespace(
+    mock_user = types.User(
         id=1234567,
         first_name="Pavel",
         last_name="Durov",
@@ -33,9 +34,9 @@ async def test_resolve_username_user_success(monkeypatch):
         bot=False,
         verified=True,
     )
-    mock_response = SimpleNamespace(
+    mock_response = types.contacts.ResolvedPeer(
         peer=types.PeerUser(user_id=1234567),
-        users=[mock_user],
+        users=[types.User(id=1), mock_user],
         chats=[],
     )
 
@@ -65,16 +66,18 @@ async def test_resolve_username_user_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_username_channel_success(monkeypatch):
-    mock_channel = SimpleNamespace(
+    mock_channel = types.Channel(
         id=987654321,
         title="Telegram News",
         broadcast=True,
         megagroup=False,
         participants_count=50000,
+        photo=types.ChatPhotoEmpty(),
+        date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
-    mock_response = SimpleNamespace(
+    mock_response = types.contacts.ResolvedPeer(
         peer=types.PeerChannel(channel_id=987654321),
-        users=[],
+        users=[types.User(id=987654321)],
         chats=[mock_channel],
     )
 
@@ -83,7 +86,6 @@ async def test_resolve_username_channel_success(monkeypatch):
 
     monkeypatch.setattr(chats, "get_client", lambda account=None: cl)
     monkeypatch.setattr(chats, "ensure_connected", AsyncMock())
-    monkeypatch.setattr(chats, "get_marked_id", lambda c: -1000000000000 - c.id)
 
     raw = await resolve_username("https://t.me/telegram")
     data = json.loads(raw)
@@ -112,3 +114,37 @@ async def test_resolve_username_error_handling(monkeypatch):
 
     res = await resolve_username("unknown_user_404")
     assert "error" in res.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "value"),
+    [
+        ("TELEGRAM_ALLOWED_CHAT_IDS", "14"),
+        ("TELEGRAM_BLOCKED_CHAT_IDS", "21"),
+        ("TELEGRAM_BLOCKED_CHAT_IDS", "@example_user"),
+    ],
+)
+async def test_resolve_username_returns_same_response_for_restricted_and_missing(
+    monkeypatch, policy, value
+):
+    monkeypatch.setenv(policy, value)
+    cl = AsyncMock(
+        side_effect=[
+            types.contacts.ResolvedPeer(
+                peer=types.PeerUser(user_id=21),
+                users=[types.User(id=21, username="example_user")],
+                chats=[],
+            ),
+            UsernameNotOccupiedError(request=None),
+        ]
+    )
+    monkeypatch.setattr(chats, "get_client", lambda account=None: cl)
+    monkeypatch.setattr(chats, "ensure_connected", AsyncMock())
+
+    assert (
+        await resolve_username("@example_user")
+        == await resolve_username("@unused_name")
+        == "No Telegram chat or user found for this username."
+    )
+    assert cl.await_count == 2

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
 import re
-from typing import Any, Optional
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from threading import Lock
+from typing import Any, Callable, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
@@ -87,6 +91,25 @@ class ProtocolNegotiationMiddleware:
         self.streamable_path = mcp_instance.settings.streamable_http_path if streamable else None
         self.signed_endpoints = frozenset(getattr(mcp_instance, "_signed_endpoints", ()))
         self.token = token
+        self._ready = True
+        if isinstance(mcp_instance, TelegramFastMCP) and mcp_instance._service_lifespan:
+            self._ready = False
+            app_lifespan = app.router.lifespan_context
+
+            @asynccontextmanager
+            async def lifespan(application):
+                async with mcp_instance.service_lifespan(), app_lifespan(application) as state:
+                    self._ready = True
+                    try:
+                        yield state
+                    finally:
+                        self._ready = False
+
+            app.router.lifespan_context = lifespan
+
+    def lifespan(self):
+        """Lifespan for a parent ASGI application mounting this app."""
+        return self.app.router.lifespan_context(self.app)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -109,9 +132,7 @@ class ProtocolNegotiationMiddleware:
         route = next(
             (route for route in self.app.routes if route.matches(scope)[0] is Match.FULL), None
         )
-        if getattr(route, "endpoint", None) in self.signed_endpoints:
-            await self.app(scope, receive, send)
-            return
+        signed_route = getattr(route, "endpoint", None) in self.signed_endpoints
 
         # Preflight is answered here without executing any app route.
         if scope["method"] == "OPTIONS":
@@ -137,13 +158,24 @@ class ProtocolNegotiationMiddleware:
             await response(scope, receive, send)
             return
 
-        if not _has_bearer_token(raw_headers, self.token):
+        if not signed_route and not _has_bearer_token(raw_headers, self.token):
             response = Response(
                 "Bearer authentication required",
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer", **cors_origin_headers},
             )
             await response(scope, receive, send)
+            return
+        if not self._ready:
+            response = Response(
+                "Telegram MCP service has not completed startup.",
+                status_code=503,
+                headers=cors_origin_headers,
+            )
+            await response(scope, receive, send)
+            return
+        if signed_route:
+            await self.app(scope, receive, send)
             return
 
         async def send_with_origin(message: Message) -> None:
@@ -255,9 +287,50 @@ class ProtocolNegotiationMiddleware:
 
 
 class TelegramFastMCP(FastMCP):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        service_lifespan: Optional[Callable[[], AbstractAsyncContextManager[None]]] = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._signed_endpoints: set = set()
+        self._service_lifespan = service_lifespan
+        self._service_lock = Lock()
+        self._service_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._service_ready = False
+
+    @asynccontextmanager
+    async def service_lifespan(self):
+        """Prepare and hold this server's Telegram sessions for one transport."""
+        if self._service_lifespan is None:
+            yield
+            return
+        with self._service_lock:
+            if self._service_loop is not None:
+                raise RuntimeError("This Telegram MCP server is already starting or running.")
+            self._service_loop = asyncio.get_running_loop()
+        try:
+            async with self._service_lifespan():
+                self._service_ready = True
+                try:
+                    yield
+                finally:
+                    self._service_ready = False
+        finally:
+            with self._service_lock:
+                self._service_loop = None
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]):
+        if self._service_lifespan is not None and (
+            not self._service_ready or self._service_loop is not asyncio.get_running_loop()
+        ):
+            raise ToolError("Telegram MCP service has not completed startup.")
+        return await super().call_tool(name, arguments)
+
+    async def run_stdio_async(self) -> None:
+        async with self.service_lifespan():
+            await super().run_stdio_async()
 
     def signed_route(self, path: str, *, methods: list[str]):
         """Register a route whose handler verifies its own signed URL."""
@@ -290,12 +363,23 @@ def _build_streamable_http_app(mcp_instance: FastMCP, app_factory) -> ASGIApp:
     configure_transport_security(mcp_instance)
     install_protocol_compatibility()
 
-    # A session manager that has shut down cannot serve a new app lifespan.
-    session_mgr = mcp_instance._session_manager
-    if session_mgr is not None and getattr(session_mgr, "_has_started", False):
-        mcp_instance._session_manager = None
+    if isinstance(mcp_instance, TelegramFastMCP) and mcp_instance._service_lifespan:
+        with mcp_instance._service_lock:
+            if mcp_instance._service_loop is not None:
+                raise RuntimeError("This Telegram MCP server is already starting or running.")
+            # The SDK's lifecycle looks up the latest manager, while the endpoint
+            # holds the manager from construction. Keep them paired for each app.
+            mcp_instance._session_manager = None
+            app = app_factory()
+            manager = mcp_instance.session_manager
+            app.router.lifespan_context = lambda app: manager.run()
+    else:
+        session_mgr = mcp_instance._session_manager
+        if session_mgr is not None and getattr(session_mgr, "_has_started", False):
+            mcp_instance._session_manager = None
+        app = app_factory()
 
-    return ProtocolNegotiationMiddleware(app_factory(), mcp_instance, token, streamable=True)
+    return ProtocolNegotiationMiddleware(app, mcp_instance, token, streamable=True)
 
 
 def create_streamable_http_app(mcp_instance: FastMCP) -> ASGIApp:
@@ -316,7 +400,10 @@ async def _run_network_app(mcp_instance: FastMCP, app: ASGIApp) -> None:
         # Access logs include query strings, which contain signed media credentials.
         access_log=False,
     )
-    await uvicorn.Server(config).serve()
+    server = uvicorn.Server(config)
+    await server.serve()
+    if not server.started:
+        raise RuntimeError("Telegram MCP network service failed to start.")
 
 
 async def run_streamable_http_async(mcp_instance: FastMCP) -> None:

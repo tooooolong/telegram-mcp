@@ -235,6 +235,50 @@ async def get_custom_emoji_pack(
         return log_and_format_error("get_custom_emoji_pack", e, pack=pack)
 
 
+async def _read_custom_emoji(document_id: Union[int, str], thumbnail: bool, account):
+    try:
+        doc_id = int(str(document_id).strip())
+        if doc_id <= 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return "Invalid document_id: must be a positive integer."
+
+    cl = get_client(account)
+    await ensure_connected(cl)
+
+    docs = await cl(functions.messages.GetCustomEmojiDocumentsRequest(document_id=[doc_id]))
+    if not docs:
+        return f"Custom emoji with document ID {doc_id} not found."
+
+    doc = docs[0]
+    data = None
+    if thumbnail:
+        try:
+            data = await cl.download_media(doc, file=bytes, thumb=-1)
+        except Exception:
+            data = None
+    if not data:
+        data = await cl.download_media(doc, file=bytes)
+    if not data:
+        return f"Failed to download media for custom emoji {doc_id}."
+
+    ext = ".webp"
+    img_format = None
+    if data.startswith(b"\xff\xd8\xff"):
+        ext = ".jpg"
+        img_format = "jpeg"
+    elif data.startswith(b"\x89PNG"):
+        ext = ".png"
+        img_format = "png"
+    elif data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
+        img_format = "webp"
+    elif data.startswith(b"\x1f\x8b"):
+        ext = ".tgs"
+    elif data.startswith(b"\x1aE\xdf\xa3"):
+        ext = ".webm"
+    return doc_id, doc, data, ext, img_format
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Preview Custom Emoji", openWorldHint=True, readOnlyHint=True
@@ -244,98 +288,67 @@ async def get_custom_emoji_pack(
 async def preview_custom_emoji(
     document_id: Union[int, str],
     thumbnail: bool = True,
-    save_path: Optional[str] = None,
-    ctx: Optional[Context] = None,
     account: Optional[str] = None,
 ):
-    """
-    Preview or download a custom emoji by its Telegram document ID.
-
-    Args:
-        document_id: Telegram document ID of the custom emoji (from
-        get_custom_emoji_pack or message metadata).
-        thumbnail: If True, downloads the static thumbnail image preview
-        (ideal for animated TGS and video WebM emojis).
-        save_path: Optional path under allowed roots to save the preview or emoji file.
-        account: Optional account alias or phone number.
-    """
+    """Return a custom emoji image. Use thumbnail=True for animated emoji."""
     try:
-        try:
-            doc_id = int(str(document_id).strip())
-            if doc_id <= 0:
-                raise ValueError()
-        except (ValueError, TypeError):
-            return "Invalid document_id: must be a positive integer."
-
-        cl = get_client(account)
-        await ensure_connected(cl)
-
-        docs = await cl(functions.messages.GetCustomEmojiDocumentsRequest(document_id=[doc_id]))
-        if not docs:
-            return f"Custom emoji with document ID {doc_id} not found."
-
-        doc = docs[0]
-
-        data = None
-        if thumbnail:
-            try:
-                data = await cl.download_media(doc, file=bytes, thumb=-1)
-            except Exception:
-                data = None
-        if not data:
-            data = await cl.download_media(doc, file=bytes)
-
-        if not data:
-            return f"Failed to download media for custom emoji {doc_id}."
-
-        ext = ".webp"
-        img_format = None
-        if data.startswith(b"\xff\xd8\xff"):
-            ext = ".jpg"
-            img_format = "jpeg"
-        elif data.startswith(b"\x89PNG"):
-            ext = ".png"
-            img_format = "png"
-        elif data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == b"WEBP":
-            ext = ".webp"
-            img_format = "webp"
-        elif data.startswith(b"\x1f\x8b"):
-            ext = ".tgs"
-        elif data.startswith(b"\x1aE\xdf\xa3"):
-            ext = ".webm"
-
-        saved_path_str = None
-        if save_path:
-            kept_path, path_error = await _resolve_writable_file_path(
-                raw_path=save_path,
-                default_filename=f"custom_emoji_{doc_id}{ext}",
-                ctx=ctx,
-                tool_name="preview_custom_emoji",
-            )
-            if path_error:
-                return path_error
-            kept_path.parent.mkdir(parents=True, exist_ok=True)
-            kept_path.write_bytes(data)
-            saved_path_str = str(kept_path)
-
+        result = await _read_custom_emoji(document_id, thumbnail, account)
+        if isinstance(result, str):
+            return result
+        doc_id, doc, data, ext, img_format = result
         if img_format:
-            image = Image(data=data, format=img_format)
-            if saved_path_str:
-                return [f"Custom emoji {doc_id} saved to {saved_path_str}.", image]
-            return image
-
-        if saved_path_str:
-            return f"Custom emoji {doc_id} downloaded and saved to {saved_path_str}."
-
+            return Image(data=data, format=img_format)
         return (
             f"Custom emoji {doc_id} has format '{ext.lstrip('.')}' "
             f"({getattr(doc, 'mime_type', 'unknown')}) "
             "which cannot be rendered as a static image without thumbnail. "
-            "Please call with thumbnail=True or provide save_path to download."
+            "Please call with thumbnail=True or use save_custom_emoji to download."
         )
     except Exception as e:
+        return log_and_format_error("preview_custom_emoji", e, document_id=document_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Save Custom Emoji", openWorldHint=True, readOnlyHint=False)
+)
+@with_account(readonly=False)
+async def save_custom_emoji(
+    document_id: Union[int, str],
+    save_path: str,
+    thumbnail: bool = True,
+    ctx: Optional[Context] = None,
+    account: Optional[str] = None,
+) -> str:
+    """Save a custom emoji or its thumbnail to a new file under the allowed roots."""
+    if not save_path.strip():
+        return "A destination file path is required."
+    try:
+        result = await _read_custom_emoji(document_id, thumbnail, account)
+        if isinstance(result, str):
+            return result
+        doc_id, _, data, ext, _ = result
+        kept_path, error = await _resolve_writable_file_path(
+            raw_path=save_path,
+            default_filename=f"custom_emoji_{doc_id}{ext}",
+            ctx=ctx,
+            tool_name="save_custom_emoji",
+        )
+        if error:
+            return error
+        try:
+            destination = kept_path.open("xb")
+        except FileExistsError:
+            return "Destination file already exists. Choose a new path."
+        try:
+            with destination:
+                destination.write(data)
+        except OSError:
+            kept_path.unlink(missing_ok=True)
+            raise
+        return f"Custom emoji {doc_id} saved to {kept_path}."
+    except Exception as e:
         return log_and_format_error(
-            "preview_custom_emoji", e, document_id=document_id, save_path=save_path
+            "save_custom_emoji", e, document_id=document_id, save_path=save_path
         )
 
 
@@ -344,4 +357,5 @@ __all__ = [
     "get_custom_emoji_packs",
     "get_custom_emoji_pack",
     "preview_custom_emoji",
+    "save_custom_emoji",
 ]

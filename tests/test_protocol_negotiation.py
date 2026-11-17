@@ -1,9 +1,15 @@
 """Tests for MCP 2026-07-28 protocol negotiation, backward compatibility, and discovery."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
+from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse
+from starlette.routing import Mount
 from starlette.testclient import TestClient
 
 from telegram_mcp.transport import (
@@ -17,6 +23,7 @@ from telegram_mcp.transport import (
     is_supported_protocol_version,
     negotiate_protocol_version,
 )
+from telegram_mcp import runner, runtime
 from telegram_mcp.runtime import mcp
 import telegram_mcp.server as server
 
@@ -26,6 +33,11 @@ _AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 
 @pytest.fixture(autouse=True)
 def _configure_auth(monkeypatch):
+    @asynccontextmanager
+    async def test_lifespan():
+        yield
+
+    monkeypatch.setattr(mcp, "_service_lifespan", test_lifespan)
     monkeypatch.setenv("MCP_AUTH_TOKEN", _TEST_TOKEN)
 
 
@@ -130,10 +142,120 @@ async def test_sse_authorized_client_receives_message_endpoint():
             (b"authorization", f"Bearer {_TEST_TOKEN}".encode()),
         ],
     }
-    await asyncio.wait_for(app(scope, receive, send), timeout=2)
+    async with app.lifespan():
+        await asyncio.wait_for(app(scope, receive, send), timeout=2)
 
     assert response[0]["status"] == 200
     assert any(b"data: /messages/?session_id=" in m.get("body", b"") for m in response)
+
+
+@pytest.mark.parametrize(
+    "app_factory, path",
+    [(server.get_http_app, "/mcp"), (mcp.sse_app, "/sse")],
+)
+def test_embedded_app_requires_lifespan(app_factory, path):
+    client = TestClient(app_factory(), base_url="http://localhost:8765")
+
+    response = client.get(path, headers=_AUTH_HEADERS)
+
+    assert response.status_code == 503
+    assert "has not completed startup" in response.text
+
+
+@pytest.mark.asyncio
+async def test_direct_tool_calls_require_service_lifespan():
+    with pytest.raises(ToolError, match="has not completed startup"):
+        await server.get_server().call_tool("list_accounts", {})
+
+
+@pytest.fixture
+def embedded_client(tmp_path, monkeypatch):
+    account = SimpleNamespace(
+        connect=AsyncMock(),
+        disconnect=AsyncMock(),
+        is_user_authorized=AsyncMock(return_value=True),
+        get_me=AsyncMock(return_value=SimpleNamespace(username="work_account")),
+        get_dialogs=AsyncMock(return_value=[]),
+    )
+    session_lock = runner.SessionLock
+    monkeypatch.setattr(
+        runner,
+        "SessionLock",
+        lambda label, identity: session_lock(label, identity, lock_dir=tmp_path),
+    )
+    monkeypatch.setattr(runner, "clients", {"work": account})
+    monkeypatch.setattr(runner, "_service_configured", False)
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", runtime.SERVER_ALLOWED_ROOTS)
+    monkeypatch.setattr(runtime, "EXTENSION_ALLOWLISTS", runtime.EXTENSION_ALLOWLISTS)
+    monkeypatch.setattr(mcp._tool_manager, "_tools", dict(mcp._tool_manager._tools))
+    monkeypatch.setattr(mcp, "_service_lifespan", runtime._telegram_service_lifespan)
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USERNAME_WORK", "work_account")
+    return account
+
+
+@pytest.mark.parametrize("app_factory", [server.get_http_app, mcp.sse_app])
+def test_embedded_lifespan_applies_security_configuration(
+    app_factory, embedded_client, tmp_path, monkeypatch
+):
+    root = tmp_path / "allowed"
+    monkeypatch.setenv("TELEGRAM_ALLOWED_ROOTS", str(root))
+    monkeypatch.setenv("TELEGRAM_FILE_EXTENSIONS", "send_file:.pdf")
+    monkeypatch.setenv("TELEGRAM_EXPOSED_TOOLS", "read-only")
+    app = app_factory()
+    embedded_client.connect.assert_not_called()
+
+    with TestClient(app, base_url="http://localhost:8765"):
+        embedded_client.get_me.assert_awaited_once()
+        assert runner._session_locks.keys() == {"work"}
+        assert runtime.SERVER_ALLOWED_ROOTS == [root.resolve()]
+        assert runtime.EXTENSION_ALLOWLISTS["send_file"] == {".pdf"}
+        tools = {tool.name for tool in mcp._tool_manager.list_tools()}
+        assert "list_accounts" in tools
+        assert "send_file" not in tools
+
+    embedded_client.disconnect.assert_awaited()
+    assert not runner._session_locks
+
+
+def test_embedded_lifespan_rejects_wrong_account_and_releases_lock(embedded_client, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_EXPECTED_USERNAME_WORK", "different_account")
+
+    with pytest.raises(RuntimeError, match="logged in to a different account"):
+        with TestClient(server.get_http_app(), base_url="http://localhost:8765"):
+            pytest.fail("The app should not start with an unexpected Telegram account")
+
+    embedded_client.disconnect.assert_awaited()
+    assert not runner._session_locks
+    assert mcp._service_loop is None
+
+
+def test_mounted_embedded_app_uses_parent_lifespan(embedded_client):
+    app = server.get_http_app()
+
+    @asynccontextmanager
+    async def lifespan(_application):
+        async with app.lifespan():
+            yield
+
+    parent = Starlette(routes=[Mount("/telegram", app)], lifespan=lifespan)
+    with TestClient(parent, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
+        response = client.post("/telegram/mcp", headers=_POST_HEADERS, json=_TOOLS_LIST)
+        assert response.status_code == 200
+        assert '"tools":' in response.text
+        embedded_client.get_me.assert_awaited_once()
+
+    embedded_client.disconnect.assert_awaited()
+
+
+def test_embedded_app_builds_separate_streamable_http_session_managers(embedded_client):
+    apps = [server.get_http_app(), server.get_http_app()]
+    for app in apps:
+        with TestClient(app, base_url="http://localhost:8765", headers=_AUTH_HEADERS) as client:
+            response = client.post("/mcp", headers=_POST_HEADERS, json=_TOOLS_LIST)
+            assert response.status_code == 200
+            assert '"tools":' in response.text
+
+    assert embedded_client.get_me.await_count == 2
 
 
 def test_supported_protocol_versions():

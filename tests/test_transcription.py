@@ -1,14 +1,14 @@
 """Tests for telegram_mcp/transcription.py: config, cache, engines, budget, render."""
 
 import asyncio
+import json
 import os
 import stat
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from telegram_mcp import transcription
+from telegram_mcp import transcription, whisper_worker
 
 
 def _async_return(value):
@@ -139,7 +139,7 @@ def test_legacy_cache_is_preserved_and_account_cache_starts_empty(
     import sqlite3
 
     path = transcription._cache_db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600)
     conn = sqlite3.connect(str(path))
     conn.executescript(f"""
         CREATE TABLE transcripts (
@@ -175,6 +175,45 @@ def test_cache_file_and_directory_get_restrictive_permissions(transcript_cache_d
     db_path = transcription.cache_dir() / "transcripts.db"
     assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(transcript_cache_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions only")
+def test_cache_refuses_group_readable_directory(transcript_cache_dir):
+    transcript_cache_dir.mkdir(mode=0o750)
+    with pytest.raises(PermissionError, match="only to its owner"):
+        transcription.get_cached_transcript(101, 1, 2, 911)
+    assert not (transcript_cache_dir / "transcripts.db").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions only")
+@pytest.mark.parametrize("name", ["transcripts.db", "transcripts.db-wal", "transcripts.db-shm"])
+def test_cache_checks_existing_file_permissions_before_open(
+    transcript_cache_dir, monkeypatch, name
+):
+    transcript_cache_dir.mkdir(mode=0o700)
+    path = transcript_cache_dir / name
+    path.touch()
+    path.chmod(0o644)
+    monkeypatch.setattr(
+        transcription.sqlite3, "connect", lambda *_: pytest.fail("SQLite opened an unsafe path")
+    )
+    with pytest.raises(PermissionError, match="only to its owner"):
+        transcription.get_cached_transcript(101, 1, 2, 911)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_voice_listing_survives_unavailable_cache(monkeypatch):
+    def offline(*_):
+        raise PermissionError("cache needs private ownership")
+
+    warnings = []
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
+    monkeypatch.setattr(transcription.logger, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(transcription, "get_cached_transcript", offline)
+    info = transcription.voice_attachment_info(_voice_msg(), 1, account_id=101)
+    assert info["duration"] == 23
+    assert info["transcript"] is None
+    assert warnings and "Transcript cache unavailable" in warnings[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -1031,65 +1070,196 @@ def test_engine_config_error(monkeypatch):
     assert transcription.engine_config_error("telegram") is None
 
 
-class _FakeWhisperModel:
-    instances = []
+class _FakeWhisperInput:
+    def __init__(self):
+        self.data = b""
+        self.closed = False
 
-    def __init__(self, name, device=None, compute_type=None, download_root=None):
-        self.args = (name, device, compute_type, download_root)
-        self.calls = []
-        _FakeWhisperModel.instances.append(self)
+    def write(self, data):
+        self.data += data
 
-    def transcribe(self, audio, language=None, vad_filter=False):
-        self.calls.append({"audio": audio.read(), "language": language})
-        segments = (SimpleNamespace(text=t) for t in [" hallo", " wereld "])
-        return segments, SimpleNamespace(language="nl")
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeWhisperProcess:
+    def __init__(self, output=b'{"status":"ok","text":"hallo wereld","lang":"nl"}'):
+        self.output = output
+        self.returncode = None
+        self.stdin = _FakeWhisperInput()
+        self.stdout = self
+        self.killed = False
+        self.reaped = False
+
+    async def readexactly(self, length):
+        if len(self.output) < length:
+            raise asyncio.IncompleteReadError(self.output, length)
+        return self.output[:length]
+
+    async def wait(self):
+        self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+    async def communicate(self):
+        self.reaped = True
+        return b"", b""
+
+
+def _whisper_client(*chunks):
+    async def download_media(msg, file):
+        for piece in chunks:
+            file.write(piece)
+
+    return SimpleNamespace(download_media=download_media)
 
 
 @pytest.fixture
 def fake_whisper(monkeypatch):
-    import sys
-
-    _FakeWhisperModel.instances = []
-    monkeypatch.setitem(
-        sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=_FakeWhisperModel)
-    )
     monkeypatch.setattr(transcription, "whisper_available", lambda: True)
-    monkeypatch.setattr(transcription, "_WHISPER_MODELS", {})
-    monkeypatch.setattr(transcription, "_WHISPER_SEMAPHORE", None)
-    return _FakeWhisperModel
+    monkeypatch.setattr(transcription, "_whisper_supported", lambda: True)
+    return _FakeWhisperProcess()
 
 
 @pytest.mark.asyncio
-async def test_whisper_transcribes_locally_and_reuses_the_model(monkeypatch, fake_whisper):
+async def test_whisper_sends_bounded_audio_and_selected_model_to_worker(monkeypatch, fake_whisper):
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_MODEL", "large-v3-turbo")
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_DEVICE", "cpu")
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_COMPUTE_TYPE", "int8")
-    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_WHISPER_MODEL_DIR", raising=False)
-    monkeypatch.delenv("TELEGRAM_TRANSCRIBE_LANGUAGE", raising=False)
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_WHISPER_MODEL_DIR", "/local/model")
+    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_LANGUAGE", "nl")
+    monkeypatch.setenv("GROQ_API_KEY", "test-provider-secret")
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING", "test-session-secret")
+    calls = []
 
-    def _no_http(**kw):
-        raise AssertionError("whisper engine must not make HTTP calls")
+    async def spawn(*args, **kwargs):
+        calls.append((args, kwargs))
+        return fake_whisper
 
-    monkeypatch.setattr(transcription.httpx, "AsyncClient", _no_http)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    result = await transcription.transcribe(
+        _whisper_client(b"ordinary", b"audio"), None, _voice_msg(), "whisper"
+    )
 
-    first = await transcription.transcribe(_bytes_client(b"audio"), None, _voice_msg(), "whisper")
-    second = await transcription.transcribe(_bytes_client(b"audio"), None, _voice_msg(), "whisper")
-
-    assert first == {"status": "ok", "text": "hallo wereld", "lang": "nl"}
-    assert second["status"] == "ok"
-    assert len(fake_whisper.instances) == 1
-    model = fake_whisper.instances[0]
-    assert model.args == ("large-v3-turbo", "cpu", "int8", None)
-    assert model.calls[0] == {"audio": b"audio", "language": None}
+    assert result == {"status": "ok", "text": "hallo wereld", "lang": "nl"}
+    assert fake_whisper.stdin.data == b"ordinaryaudio"
+    assert fake_whisper.stdin.closed
+    args, kwargs = calls[0]
+    assert json.loads(args[-1]) == [["large-v3-turbo", "cpu", "int8", "/local/model"], "nl"]
+    assert "GROQ_API_KEY" not in kwargs["env"]
+    assert "TELEGRAM_SESSION_STRING" not in kwargs["env"]
 
 
 @pytest.mark.asyncio
-async def test_whisper_passes_language_hint(monkeypatch, fake_whisper):
-    monkeypatch.setenv("TELEGRAM_TRANSCRIBE_LANGUAGE", "nl")
+@pytest.mark.parametrize("declared", [True, False])
+async def test_whisper_checks_declared_and_downloaded_byte_limit(
+    monkeypatch, fake_whisper, declared
+):
+    monkeypatch.setattr(whisper_worker, "MAX_AUDIO_BYTES", 5)
+    downloads = []
 
-    await transcription.transcribe(_bytes_client(), None, _voice_msg(), "whisper")
+    async def download_media(msg, file):
+        downloads.append(msg)
+        file.write(b"audio")
+        file.write(b" samples")
 
-    assert fake_whisper.instances[0].calls[0]["language"] == "nl"
+    async def unexpected_spawn(*args, **kwargs):
+        pytest.fail("An unbounded recording reached the worker")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
+    client = SimpleNamespace(download_media=download_media)
+    msg = _voice_msg()
+    if declared:
+        msg.file.size = 6
+    result = await transcription.transcribe(client, None, msg, "whisper")
+
+    assert result["status"] == "error" and "5 bytes" in result["error"]
+    assert downloads == ([] if declared else [msg])
+
+
+@pytest.mark.asyncio
+async def test_whisper_checks_recording_duration_before_download(monkeypatch, fake_whisper):
+    monkeypatch.setattr(whisper_worker, "MAX_AUDIO_SECONDS", 22)
+
+    result = await transcription.transcribe(None, None, _voice_msg(), "whisper")
+
+    assert result["status"] == "error" and "22 seconds" in result["error"]
+
+
+def test_whisper_checks_decoded_samples_without_recording_metadata():
+    frames = [
+        SimpleNamespace(samples=1, to_ndarray=lambda: SimpleNamespace(reshape=lambda _: [2])),
+        SimpleNamespace(samples=2, to_ndarray=lambda: pytest.fail("Over-budget frame was copied")),
+    ]
+    audio = [0, 0]
+    with pytest.raises(whisper_worker.AudioLimitExceeded):
+        whisper_worker._collect_samples(frames, lambda frame: [frame], audio)
+    assert audio == [2, 0]
+
+
+@pytest.mark.asyncio
+async def test_whisper_admits_before_download_and_releases_on_cancellation(
+    monkeypatch, fake_whisper
+):
+    entered = asyncio.Event()
+
+    async def stall(length):
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(fake_whisper, "readexactly", stall)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _async_return(fake_whisper))
+    request = asyncio.create_task(
+        transcription.transcribe(_whisper_client(b"audio"), None, _voice_msg(), "whisper")
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    busy = await transcription.transcribe(None, None, _voice_msg(), "whisper")
+    assert busy["status"] == "error" and "busy" in busy["error"]
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert fake_whisper.killed and fake_whisper.reaped
+
+    next_worker = _FakeWhisperProcess()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _async_return(next_worker))
+    success = await transcription.transcribe(
+        _whisper_client(b"audio"), None, _voice_msg(), "whisper"
+    )
+    assert success["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_whisper_deadline_reaps_child_and_returns_error(monkeypatch, fake_whisper):
+    async def stall(length):
+        await asyncio.Future()
+
+    monkeypatch.setattr(whisper_worker, "WALL_SECONDS", 0.05)
+    monkeypatch.setattr(fake_whisper, "readexactly", stall)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _async_return(fake_whisper))
+
+    result = await transcription.transcribe(
+        _whisper_client(b"audio"), None, _voice_msg(), "whisper"
+    )
+    assert result["status"] == "error" and "deadline" in result["error"]
+    assert fake_whisper.killed and fake_whisper.reaped
+
+
+@pytest.mark.asyncio
+async def test_whisper_rejects_worker_output_above_limit(monkeypatch, fake_whisper):
+    monkeypatch.setattr(transcription, "_WHISPER_OUTPUT_BYTES", 32)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _async_return(fake_whisper))
+
+    result = await transcription.transcribe(
+        _whisper_client(b"audio"), None, _voice_msg(), "whisper"
+    )
+    assert result["status"] == "error" and "output limit" in result["error"]
+    assert fake_whisper.killed and fake_whisper.reaped
 
 
 @pytest.mark.asyncio
@@ -1103,16 +1273,14 @@ async def test_whisper_not_installed_is_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_whisper_inference_failure_is_error(monkeypatch, fake_whisper):
-    def _explode(self, audio, language=None, vad_filter=False):
-        raise RuntimeError("bad audio")
+async def test_whisper_unavailable_without_resource_limits(monkeypatch):
+    monkeypatch.setattr(transcription, "whisper_available", lambda: True)
+    monkeypatch.setattr(transcription, "_whisper_supported", lambda: False)
 
-    monkeypatch.setattr(_FakeWhisperModel, "transcribe", _explode)
-
-    result = await transcription.transcribe(_bytes_client(), None, _voice_msg(), "whisper")
+    result = await transcription.transcribe(None, None, _voice_msg(), "whisper")
 
     assert result["status"] == "error"
-    assert "bad audio" in result["error"]
+    assert "requires Linux" in result["error"]
 
 
 def test_default_cache_falls_back_to_a_user_cache_when_cwd_is_unusable(tmp_path, monkeypatch):
@@ -1138,7 +1306,7 @@ def test_default_cache_stays_in_the_working_directory_when_it_is_writable(tmp_pa
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("TELEGRAM_TRANSCRIPT_CACHE_DIR", raising=False)
 
-    assert transcription.cache_dir() == Path("data/transcripts")
+    assert transcription.cache_dir() == tmp_path.resolve() / "data" / "transcripts"
     assert (tmp_path / "data" / "transcripts").is_dir()
 
 

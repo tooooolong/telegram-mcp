@@ -8,6 +8,7 @@ data/
 transcript_cache/
 downloads/
 uploads/
+.telegram-mcp-transfers/
 aliases.json
 incoming_feed.jsonl
 

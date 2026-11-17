@@ -3,15 +3,17 @@
 import secrets
 import struct
 
-from telethon.errors import BotMethodInvalidError
+from telethon.errors import BotMethodInvalidError, UsernameInvalidError, UsernameNotOccupiedError
 from telethon.tl.tlobject import TLObject, TLRequest
 
 from telegram_mcp.runtime import *
+from telegram_mcp.tools.contacts import _lookup_peer_entity
 from telegram_mcp.tools.messages import in_allowed_topics, topic_thread_kwargs
 
 # Recent messages get_chat looks through for the last one of a chat's allowed topics
 # when they cannot be read as one thread (General, or several topics).
 LAST_MESSAGE_TOPIC_WINDOW = 20
+_USERNAME_NOT_FOUND = "No Telegram chat or user found for this username."
 
 
 class GetForumTopicsRequest(TLRequest):
@@ -1079,26 +1081,20 @@ async def resolve_username(username: str, account: Optional[str] = None) -> str:
         if not clean_user:
             return "Invalid username: must be a non-empty alphanumeric username."
 
-        if is_chat_blocked(clean_user):
-            return check_chat_access(clean_user)
-
         cl = get_client(account)
         await ensure_connected(cl)
         result = await cl(functions.contacts.ResolveUsernameRequest(username=clean_user))
+        entity = _lookup_peer_entity(result)
+        if entity is None or not is_chat_allowed(clean_user, entity):
+            return _USERNAME_NOT_FOUND
 
-        peer_id = None
-        peer_type = "unknown"
-        if getattr(result, "peer", None):
-            peer = result.peer
-            if isinstance(peer, types.PeerUser):
-                peer_id = peer.user_id
-                peer_type = "user"
-            elif isinstance(peer, types.PeerChannel):
-                peer_id = -1000000000000 - peer.channel_id
-                peer_type = "channel"
-            elif isinstance(peer, types.PeerChat):
-                peer_id = -peer.chat_id
-                peer_type = "chat"
+        peer_id = get_marked_id(entity)
+        if isinstance(result.peer, types.PeerUser):
+            peer_type = "user"
+        elif isinstance(result.peer, types.PeerChannel):
+            peer_type = "channel"
+        else:
+            peer_type = "chat"
 
         entity_info: Dict[str, Any] = {
             "query": username,
@@ -1107,40 +1103,33 @@ async def resolve_username(username: str, account: Optional[str] = None) -> str:
             "peer_type": peer_type,
         }
 
-        users = getattr(result, "users", [])
-        chats = getattr(result, "chats", [])
-        entity = next(iter(users or chats), None)
-        if (is_chat_allowlist_enabled() or is_chat_blocklist_enabled()) and not is_chat_allowed(
-            peer_id, entity
-        ):
-            return check_chat_access(peer_id, entity)
-        if users:
-            u = users[0]
+        if peer_type == "user":
             entity_info.update(
                 {
-                    "id": getattr(u, "id", peer_id),
-                    "first_name": sanitize_user_content(getattr(u, "first_name", None) or ""),
-                    "last_name": sanitize_user_content(getattr(u, "last_name", None) or ""),
-                    "phone": getattr(u, "phone", None),
-                    "is_bot": bool(getattr(u, "bot", False)),
-                    "verified": bool(getattr(u, "verified", False)),
+                    "id": peer_id,
+                    "first_name": sanitize_user_content(entity.first_name or ""),
+                    "last_name": sanitize_user_content(entity.last_name or ""),
+                    "phone": entity.phone,
+                    "is_bot": bool(entity.bot),
+                    "verified": bool(entity.verified),
                 }
             )
-        elif chats:
-            c = chats[0]
+        else:
             entity_info.update(
                 {
-                    "id": get_marked_id(c),
-                    "title": sanitize_user_content(getattr(c, "title", None) or ""),
-                    "participants_count": getattr(c, "participants_count", None),
-                    "broadcast": bool(getattr(c, "broadcast", False)),
-                    "megagroup": bool(getattr(c, "megagroup", False)),
+                    "id": peer_id,
+                    "title": sanitize_user_content(entity.title or ""),
+                    "participants_count": getattr(entity, "participants_count", None),
+                    "broadcast": bool(getattr(entity, "broadcast", False)),
+                    "megagroup": bool(getattr(entity, "megagroup", False)),
                 }
             )
 
         return json.dumps(entity_info, indent=2, ensure_ascii=False)
+    except (UsernameInvalidError, UsernameNotOccupiedError):
+        return _USERNAME_NOT_FOUND
     except Exception as e:
-        return log_and_format_error("normalize_username", "resolve_username", e, username=username)
+        return log_and_format_error("resolve_username", e, username=username)
 
 
 @mcp.tool(

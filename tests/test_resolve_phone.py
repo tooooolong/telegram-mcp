@@ -152,6 +152,30 @@ async def test_resolve_phone_explains_an_unused_number(server):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("policy", "value"),
+    [("TELEGRAM_ALLOWED_CHAT_IDS", "10"), ("TELEGRAM_BLOCKED_CHAT_IDS", "42")],
+)
+async def test_resolve_phone_returns_same_response_for_restricted_and_missing(
+    server, monkeypatch, policy, value
+):
+    monkeypatch.setenv(policy, value)
+    hidden = await contacts.resolve_phone("+79990001122")
+    server.error = PhoneNotOccupiedError(request=None)
+    missing = await contacts.resolve_phone("+79990001122")
+
+    assert hidden == missing
+    assert missing.startswith("No Telegram user found for this number")
+
+
+@pytest.mark.asyncio
+async def test_resolve_phone_accepts_allowed_user(server, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "42")
+
+    assert "first_name='Lead'" in await contacts.resolve_phone("+79990001122")
+
+
+@pytest.mark.asyncio
 async def test_resolve_phone_explains_an_invalid_number(server):
     server.error = PhoneNumberInvalidError(request=None)
 

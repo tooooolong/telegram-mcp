@@ -23,9 +23,10 @@ Depending on your client setup and workload, choose one of two deployment archit
    # Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING, and MCP_AUTH_TOKEN
    ```
 
-2. Ensure the transcript cache directory exists and has correct ownership for the non-root `appuser` (UID 1000):
+2. Make the transcript cache directory private to the non-root `appuser` (UID 1000):
    ```bash
    mkdir -p ./transcript_cache
+   chmod 700 ./transcript_cache
    chown -R 1000:1000 ./transcript_cache  # On Linux/macOS
    ```
 

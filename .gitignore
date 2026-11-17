@@ -12,6 +12,7 @@ build/
 develop-eggs/
 dist/
 downloads/
+.telegram-mcp-transfers/
 eggs/
 .eggs/
 lib/

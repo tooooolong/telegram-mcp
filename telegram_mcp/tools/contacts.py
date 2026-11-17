@@ -4,9 +4,61 @@ from telegram_mcp.runtime import *
 from typing import Final, Optional
 import weakref
 
-from telethon.errors import PhoneNotOccupiedError, PhoneNumberInvalidError
+from telethon.errors import (
+    PhoneNotOccupiedError,
+    PhoneNumberInvalidError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+)
 
 from telegram_mcp.resolve_phone_limit import ResolvePhoneLimiter
+
+_PHONE_NOT_FOUND = (
+    "No Telegram user found for this number, or the owner's privacy settings "
+    "hide it from phone lookups."
+)
+_CONTACT_POLICY_ERROR = "Error: Could not find the requested Telegram user."
+_PHONE_IMPORT_POLICY_ERROR = (
+    "Error: Phone-based contact import is unavailable with a chat access policy. "
+    "Use add_contact with an allowed Telegram username."
+)
+
+
+def _lookup_peer_entity(result):
+    peer = getattr(result, "peer", None)
+    if isinstance(peer, types.PeerUser):
+        return next(
+            (user for user in result.users if isinstance(user, User) and user.id == peer.user_id),
+            None,
+        )
+    if isinstance(peer, types.PeerChat):
+        entity_types = (Chat, types.ChatForbidden)
+    elif isinstance(peer, types.PeerChannel):
+        entity_types = (Channel, types.ChannelForbidden)
+    else:
+        return None
+    peer_id = utils.get_peer_id(peer)
+    return next(
+        (
+            chat
+            for chat in result.chats
+            if isinstance(chat, entity_types) and get_marked_id(chat) == peer_id
+        ),
+        None,
+    )
+
+
+def _ensure_user_target(identifier, user, tool_name: str) -> None:
+    if not isinstance(user, User):
+        raise ChatAccessDeniedError("Error: The target must be a Telegram user.")
+    if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
+        _ensure_requested_peer(identifier, user)
+        # Standalone account mutations require explicit target authorization.
+        # The account decorator's blind-action blocklist behavior is for chat operations.
+        if is_chat_blocked(identifier, user) or check_chat_access(
+            identifier, user, topic_restricted_tool=tool_name
+        ):
+            raise ChatAccessDeniedError(_CONTACT_POLICY_ERROR)
 
 
 async def _known_contact_visible(chat_id: int, client, entity=None) -> bool:
@@ -403,16 +455,13 @@ async def resolve_phone(phone: str, account: Optional[str] = None) -> str:
             finally:
                 cl.flood_sleep_threshold = previous_threshold
         if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
-            entities = [*getattr(result, "users", []), *getattr(result, "chats", [])]
-            for entity in entities:
-                if not is_chat_allowed(get_marked_id(entity), entity):
-                    return "No contact found."
+            user = _lookup_peer_entity(result)
+            if not isinstance(user, User) or not is_chat_allowed(user.id, user):
+                return _PHONE_NOT_FOUND
+            result = types.contacts.ResolvedPeer(peer=result.peer, users=[user], chats=[])
         return str(result)
     except PhoneNotOccupiedError:
-        return (
-            "No Telegram user found for this number, or the owner's privacy settings "
-            "hide it from phone lookups."
-        )
+        return _PHONE_NOT_FOUND
     except PhoneNumberInvalidError:
         return (
             "Error: Telegram rejected this phone number as invalid. "
@@ -449,114 +498,58 @@ async def add_contact(
 
     Note: Either phone or username must be provided. If username is provided,
     the function will resolve it and add the contact using contacts.addContact
-    API (which supports adding contacts without phone numbers).
+    API (which supports adding contacts without phone numbers). A chat access
+    policy requires a username whose resolved user is permitted.
     """
+    if not phone and not username:
+        return "Error: Either phone or username must be provided."
+    if not username and (is_chat_allowlist_enabled() or is_chat_blocklist_enabled()):
+        return _PHONE_IMPORT_POLICY_ERROR
+
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        # Normalize None to empty string for easier checking
-        phone = phone or ""
-        username = username or ""
-
-        # Validate that at least one identifier is provided
-        if not phone and not username:
-            return "Error: Either phone or username must be provided."
-
-        # If username is provided, use it for username-based contact addition
         if username:
-            # Remove @ if present
             username_clean = username.lstrip("@")
             if not username_clean:
                 return "Error: Username cannot be empty."
-
-            # Resolve username to get user information
             try:
                 resolve_result = await cl(
                     functions.contacts.ResolveUsernameRequest(username=username_clean)
                 )
-
-                # Extract user from the result
-                if not resolve_result.users:
-                    return f"Error: User with username @{username_clean} not found."
-
-                user = resolve_result.users[0]
-                if not isinstance(user, User):
-                    return "Error: Resolved entity is not a user."
-
-                user_id = user.id
-                access_hash = user.access_hash
-
-                # Use contacts.addContact to add the contact by user ID
-                from telethon.tl.types import InputUser
-
-                result = await cl(
-                    functions.contacts.AddContactRequest(
-                        id=InputUser(user_id=user_id, access_hash=access_hash),
-                        first_name=first_name,
-                        last_name=last_name,
-                        phone="",  # Empty phone for username-based contacts
-                    )
-                )
-
-                if hasattr(result, "updates") and result.updates:
-                    return (
-                        f"Contact {first_name} {last_name} (@{username_clean}) added successfully."
-                    )
-                else:
-                    return (
-                        f"Contact {first_name} {last_name} (@{username_clean}) "
-                        "added successfully (no updates returned)."
-                    )
-
-            except Exception as resolve_e:
-                return log_and_format_error("add_contact", resolve_e, username=username_clean)
-
-        elif phone:
-            # Original phone-based contact addition
-            from telethon.tl.types import InputPhoneContact
-
+            except (UsernameInvalidError, UsernameNotOccupiedError):
+                return _CONTACT_POLICY_ERROR
+            user = _lookup_peer_entity(resolve_result)
+            if not isinstance(user, User):
+                return _CONTACT_POLICY_ERROR
+            _ensure_user_target(username_clean, user, "add_contact")
             result = await cl(
-                functions.contacts.ImportContactsRequest(
-                    contacts=[
-                        InputPhoneContact(
-                            client_id=0,
-                            phone=phone,
-                            first_name=first_name,
-                            last_name=last_name,
-                        )
-                    ]
+                functions.contacts.AddContactRequest(
+                    id=utils.get_input_user(user),
+                    first_name=first_name,
+                    last_name=last_name,
+                    phone="",
                 )
             )
-            if result.imported:
-                return f"Contact {first_name} {last_name} added successfully."
-            else:
-                return f"Contact not added. Response: {str(result)}"
-        else:
-            return "Error: Phone number is required when username is not provided."
-    except (ImportError, AttributeError) as type_err:
-        # Try alternative approach using raw API (only for phone-based)
-        if phone and not username:
-            try:
-                result = await cl(
-                    functions.contacts.ImportContactsRequest(
-                        contacts=[
-                            {
-                                "client_id": 0,
-                                "phone": phone,
-                                "first_name": first_name,
-                                "last_name": last_name,
-                            }
-                        ]
+            suffix = "." if getattr(result, "updates", None) else " (no updates returned)."
+            return (
+                f"Contact {first_name} {last_name} (@{username_clean}) added successfully{suffix}"
+            )
+
+        result = await cl(
+            functions.contacts.ImportContactsRequest(
+                contacts=[
+                    types.InputPhoneContact(
+                        client_id=0, phone=phone, first_name=first_name, last_name=last_name
                     )
-                )
-                if hasattr(result, "imported") and result.imported:
-                    return f"Contact {first_name} {last_name} added successfully (alt method)."
-                else:
-                    return f"Contact not added. Alternative method response: {str(result)}"
-            except Exception as alt_e:
-                return log_and_format_error("add_contact", alt_e, phone=phone)
-        else:
-            return log_and_format_error("add_contact", type_err)
+                ]
+            )
+        )
+        if result.imported:
+            return f"Contact {first_name} {last_name} added successfully."
+        return f"Contact not added. Response: {str(result)}"
+    except ChatAccessDeniedError:
+        return _CONTACT_POLICY_ERROR
     except Exception as e:
         return log_and_format_error("add_contact", e, phone=phone, username=username)
 
@@ -577,6 +570,7 @@ async def delete_contact(user_id: Union[int, str], account: Optional[str] = None
     try:
         cl = get_client(account)
         user = await resolve_entity(user_id, cl)
+        _ensure_user_target(user_id, user, "delete_contact")
         await cl(functions.contacts.DeleteContactsRequest(id=[user]))
         return f"Contact with user ID {user_id} deleted."
     except Exception as e:
@@ -600,6 +594,7 @@ async def block_user(user_id: Union[int, str], account: Optional[str] = None) ->
     try:
         cl = get_client(account)
         user = await resolve_entity(user_id, cl)
+        _ensure_user_target(user_id, user, "block_user")
         await cl(functions.contacts.BlockRequest(id=user))
         return f"User {user_id} blocked."
     except Exception as e:
@@ -623,6 +618,7 @@ async def unblock_user(user_id: Union[int, str], account: Optional[str] = None) 
     try:
         cl = get_client(account)
         user = await resolve_entity(user_id, cl)
+        _ensure_user_target(user_id, user, "unblock_user")
         await cl(functions.contacts.UnblockRequest(id=user))
         return f"User {user_id} unblocked."
     except Exception as e:
@@ -636,12 +632,15 @@ async def unblock_user(user_id: Union[int, str], account: Optional[str] = None) 
 async def import_contacts(contacts: list, account: Optional[str] = None) -> str:
     """
     Import a list of contacts. Each contact should be a dict with phone, first_name, last_name.
+    This tool is unavailable when a chat access policy is active.
     """
     try:
         if not all(
             isinstance(c, dict) and c.get("phone") and c.get("first_name") for c in contacts
         ):
             return "Error: every contact needs a 'phone' and a 'first_name'; nothing was imported."
+        if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
+            return _PHONE_IMPORT_POLICY_ERROR
         cl = get_client(account)
         await ensure_connected(cl)
         input_contacts = [

@@ -1,6 +1,7 @@
 """Profile MCP tools."""
 
 from telegram_mcp.runtime import *
+from telegram_mcp.tools.contacts import _ensure_user_target
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Me", openWorldHint=True, readOnlyHint=True))
@@ -224,7 +225,7 @@ async def set_privacy_settings(
     choice hides it from them; disallow_users cannot see it even when the main choice
     shows it. A user named in both lists ends up in disallow_users; a user already in
     the opposite list is moved. Nothing changes
-    unless every user is found.
+    unless every user is found and permitted by the chat access policy.
 
     Args:
         key: The privacy setting to modify ('status' for last seen, 'phone', 'profile_photo')
@@ -255,10 +256,11 @@ async def set_privacy_settings(
             for identifier in identifiers or []:
                 try:
                     user = await resolve_entity(identifier, cl)
+                    _ensure_user_target(identifier, user, "set_privacy_settings")
+                except ChatAccessDeniedError:
+                    return None
                 except Exception:
                     logger.warning("Could not resolve a requested privacy-rule user")
-                    return None
-                if not isinstance(user, User):
                     return None
                 if user.is_self:
                     # utils.get_input_user would give InputUserSelf, which has no user_id,

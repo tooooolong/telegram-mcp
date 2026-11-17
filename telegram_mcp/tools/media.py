@@ -4,9 +4,7 @@ import io
 import json
 import mimetypes
 import os
-import shutil
 import struct
-import tempfile
 from threading import BoundedSemaphore
 from uuid import uuid4
 
@@ -23,6 +21,7 @@ from telegram_mcp.document_preview import (
     DOCUMENT_PREVIEW_MAX_TEXT,
     preview_pdf,
 )
+from telegram_mcp.private_files import create_private_file, private_staging_directory
 from telegram_mcp.photo_source import (
     AVATAR_SOURCE,
     PhotoReference,
@@ -679,10 +678,7 @@ async def download_media(
         if path_error:
             return path_error
 
-        temp_dir = Path(
-            tempfile.mkdtemp(prefix=".telegram-mcp-download-", dir=str(out_path.parent))
-        )
-        try:
+        with private_staging_directory(out_path.parent) as temp_dir:
             staged_name = out_path.with_suffix("").name if out_path.suffix else out_path.name
             temp_requested_path = temp_dir / staged_name
 
@@ -703,7 +699,7 @@ async def download_media(
                 return f"Download failed for message {message_id}."
 
             temp_final_path = Path(downloaded).resolve(strict=True)
-            if temp_final_path.parent != temp_dir.resolve():
+            if temp_final_path.parent != temp_dir:
                 return "Download failed: resulting temporary path is invalid."
             if temp_final_path.stat().st_size > limit:
                 return f"Media is too large for download_media (limit: {limit} bytes)."
@@ -719,16 +715,18 @@ async def download_media(
                 if path_error:
                     return path_error
 
+            url = None
+            if media_links.base_url() and (link_root := _first_server_root()):
+                url = await asyncio.to_thread(
+                    media_links.download_url, final_path, link_root, source_path=temp_final_path
+                )
             os.replace(temp_final_path, final_path)
-            url = media_links.download_url(final_path, _first_server_root())
             if url:
                 return (
                     f"Media downloaded to {final_path}. "
                     f"From another machine, fetch it from {url} (expires in an hour)."
                 )
             return f"Media downloaded to {final_path}."
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
     except Exception as e:
         return log_and_format_error(
             "download_media",
@@ -1483,7 +1481,15 @@ async def prepare_upload(filename: str) -> str:
     Args:
         filename: Name the file is stored and sent under, e.g. "report.pdf".
     """
-    slot = media_links.upload_slot(filename, _first_server_root())
+    try:
+        slot = media_links.upload_slot(filename, _first_server_root())
+    except OSError as exc:
+        log_and_format_error("prepare_upload", exc)
+        return (
+            "Could not prepare a private upload slot. "
+            "Check the first server root's private transfer directory and available slots. "
+            "Use a POSIX host."
+        )
     if slot is None:
         return (
             "prepare_upload needs TELEGRAM_MEDIA_BASE_URL, a server allowed root "
@@ -1522,23 +1528,25 @@ async def upload_file_body(request: Request) -> Response:
     if target is None:
         return PlainTextResponse("Not found", status_code=404)
     limit = MAX_FILE_BYTES["send_file"]
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    partial = target.with_name(target.name + ".part")
+    partial = target.with_name(media_links.UPLOAD_PARTIAL)
+    try:
+        fd = create_private_file(partial)
+    except FileExistsError:
+        return PlainTextResponse("Upload already in progress", status_code=409)
     size = 0
     try:
-        with open(partial, "xb") as out:
+        with os.fdopen(fd, "wb") as out:
             async for chunk in request.stream():
                 size += len(chunk)
                 if size > limit:
                     raise _UploadTooLarge
                 out.write(chunk)
-    except FileExistsError:
-        return PlainTextResponse("Upload already in progress", status_code=409)
+        try:
+            os.link(partial, target)
+        except FileExistsError:
+            return PlainTextResponse("Not found", status_code=404)
     except _UploadTooLarge:
-        partial.unlink(missing_ok=True)
         return PlainTextResponse(f"File too large (limit: {limit} bytes)", status_code=413)
-    except BaseException:
+    finally:
         partial.unlink(missing_ok=True)
-        raise
-    os.replace(partial, target)
     return JSONResponse({"file_path": str(target), "size": size}, status_code=201)

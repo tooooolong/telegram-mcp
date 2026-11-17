@@ -39,12 +39,12 @@ __all__ = [
 
 
 def get_server() -> Any:
-    """Return the underlying FastMCP server instance."""
+    """Return the FastMCP instance. Its service lifespan is required to call tools."""
     return mcp
 
 
 def get_http_app() -> Any:
-    """Return the authenticated ASGI application with protocol negotiation."""
+    """Return the authenticated ASGI application. Run its lifespan before serving."""
     return create_streamable_http_app(mcp)
 
 

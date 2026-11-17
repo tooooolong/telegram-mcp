@@ -15,8 +15,8 @@ Four engines behind one interface (see ``transcribe``):
   (OpenAI itself, a self-hosted achetronic/parakeet or speaches server,
   LocalAI, a vLLM whisper, ...) at a configured base URL, with an optional
   API key.
-* ``whisper`` - a local faster-whisper model loaded in this process. Never
-  leaves the machine; needs the ``whisper`` extra installed.
+* ``whisper`` - a local faster-whisper model loaded in a resource-limited
+  subprocess on Linux. The recording stays on the machine.
 
 ``groq`` and ``openai`` share one HTTP path
 (:func:`_transcribe_via_openai_compatible`); only their settings differ.
@@ -29,18 +29,27 @@ alongside ``text`` rather than presenting it as exact speech.
 import asyncio
 import importlib.util
 import io
+import json
+import logging
 import os
 import sqlite3
-from contextlib import asynccontextmanager
+import sys
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import BoundedSemaphore
 from typing import Optional
 
 import httpx
 from telethon.tl import functions
 
+from telegram_mcp import whisper_worker
+from telegram_mcp.private_files import prepare_private_directory
+from telegram_mcp.private_sqlite import prepare_private_sqlite_file
 from telegram_mcp.runtime import account_is_premium, get_marked_id, is_premium_rpc_error
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -195,6 +204,10 @@ def whisper_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
+def _whisper_supported() -> bool:
+    return sys.platform == "linux"
+
+
 def engine_config_error(engine: str) -> Optional[str]:
     """Why ``engine`` cannot run with the current settings, or None.
 
@@ -210,11 +223,14 @@ def engine_config_error(engine: str) -> Optional[str]:
             "TELEGRAM_TRANSCRIBE_OPENAI_URL is not configured on this server. Set it to the "
             "base URL of an OpenAI-compatible API (e.g. https://api.openai.com/v1)."
         )
-    if engine == "whisper" and not whisper_available():
-        return (
-            "faster-whisper is not installed on this server. Install it with "
-            "pip install 'telegram-mcp[whisper]' (or pip install faster-whisper)."
-        )
+    if engine == "whisper":
+        if not whisper_available():
+            return (
+                "faster-whisper is not installed on this server. Install it with "
+                "pip install 'telegram-mcp[whisper]' (or pip install faster-whisper)."
+            )
+        if not _whisper_supported():
+            return "Local Whisper requires Linux resource limits. Select another engine."
     return None
 
 
@@ -255,27 +271,31 @@ def _too_large(size: int, limit: int, cfg: HttpEngineConfig) -> dict:
 DEFAULT_CACHE_DIR = "data/transcripts"
 
 
+def _prepare_cache_directory(path: Path) -> Path:
+    path = path.expanduser().absolute()
+    missing_parents = []
+    parent = path.parent
+    while not parent.exists() and not parent.is_symlink():
+        missing_parents.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing_parents):
+        prepare_private_directory(directory)
+    return prepare_private_directory(path)
+
+
 def cache_dir() -> Path:
     raw = os.getenv("TELEGRAM_TRANSCRIPT_CACHE_DIR")
     if raw:
-        d = Path(raw)
-        d.mkdir(parents=True, exist_ok=True)
-    else:
-        # The default is relative to the working directory, which is wherever the MCP client
-        # started the server: often "/" or another read-only folder when the installed
-        # `telegram-mcp` script is used. Fall back to a per-user cache instead of failing
-        # every listing that contains a voice message.
-        d = Path(DEFAULT_CACHE_DIR)
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            d = Path.home() / ".cache" / "telegram-mcp" / "transcripts"
-            d.mkdir(parents=True, exist_ok=True)
+        return _prepare_cache_directory(Path(raw))
+    default = Path(DEFAULT_CACHE_DIR)
     try:
-        os.chmod(d, 0o700)
+        return _prepare_cache_directory(default)
     except OSError:
-        pass
-    return d
+        # The client's CWD may be read-only. An existing unsafe cache needs
+        # operator attention instead of falling back and leaving it in place.
+        if default.exists() or default.is_symlink():
+            raise
+        return _prepare_cache_directory(Path.home() / ".cache" / "telegram-mcp" / "transcripts")
 
 
 def _cache_db_path() -> Path:
@@ -283,11 +303,12 @@ def _cache_db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    path = _cache_db_path()
+    path = prepare_private_sqlite_file(_cache_db_path())
     conn = sqlite3.connect(str(path))
     # Rows in the former transcripts table have no verifiable owner. Keep the
     # table intact and start with a separate account-scoped cache.
-    conn.execute("""
+    try:
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS account_transcripts (
             account_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL,
@@ -301,11 +322,10 @@ def _connect() -> sqlite3.Connection:
             PRIMARY KEY (account_id, chat_id, message_id, media_id, source)
         )
         """)
-    conn.commit()
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        conn.commit()
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -540,12 +560,9 @@ async def _transcribe_via_groq(cl, msg) -> dict:
     return await _transcribe_via_openai_compatible(cl, msg, http_engine_config("groq"))
 
 
-# Local faster-whisper. Loading a model takes seconds and hundreds of MB, so
-# one instance per (model, device, compute type) lives for the process. The
-# semaphore runs one inference at a time: two concurrent CPU transcriptions
-# only slow each other down.
-_WHISPER_MODELS: dict = {}
-_WHISPER_SEMAPHORE: Optional[asyncio.Semaphore] = None
+# Admit one request before any recording bytes are downloaded.
+_WHISPER_SLOT = BoundedSemaphore(1)
+_WHISPER_OUTPUT_BYTES = 256 * 1024
 
 
 def _whisper_settings() -> tuple:
@@ -557,55 +574,101 @@ def _whisper_settings() -> tuple:
     )
 
 
-def _load_whisper_model(settings: tuple):
-    model = _WHISPER_MODELS.get(settings)
-    if model is None:
-        from faster_whisper import WhisperModel
-
-        name, device, compute_type, download_root = settings
-        model = WhisperModel(
-            name, device=device, compute_type=compute_type, download_root=download_root
-        )
-        _WHISPER_MODELS[settings] = model
-    return model
+class _WhisperDownload(io.BytesIO):
+    def write(self, data):
+        if self.tell() + len(data) > whisper_worker.MAX_AUDIO_BYTES:
+            raise whisper_worker.AudioLimitExceeded
+        return super().write(data)
 
 
-def _run_whisper(data: bytes, settings: tuple, language: Optional[str]) -> tuple:
-    model = _load_whisper_model(settings)
-    segments, info = model.transcribe(io.BytesIO(data), language=language, vad_filter=True)
-    # segments is a lazy generator: the actual decoding happens here, so it
-    # must be consumed inside the worker thread.
-    text = "".join(segment.text for segment in segments).strip()
-    return text, getattr(info, "language", None)
+async def _run_whisper(data: bytes) -> dict:
+    env = {
+        name: os.environ[name]
+        for name in ("HOME", "XDG_CACHE_HOME", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE")
+        if name in os.environ
+    }
+    env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        "-B",
+        str(Path(whisper_worker.__file__).resolve()),
+        json.dumps((_whisper_settings(), transcribe_language()), ensure_ascii=False),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=env,
+    )
+    try:
+        with suppress(BrokenPipeError, ConnectionResetError):
+            process.stdin.write(data)
+            await process.stdin.drain()
+        process.stdin.close()
+        try:
+            await process.stdout.readexactly(_WHISPER_OUTPUT_BYTES + 1)
+        except asyncio.IncompleteReadError as end:
+            output = end.partial
+        else:
+            raise ValueError("Whisper exceeded the worker output limit.")
+        code = await process.wait()
+        if code == 3:
+            return {"status": "error", "error": "Could not apply Linux limits to local Whisper."}
+        if code != 0:
+            return {
+                "status": "error",
+                "error": "Whisper worker stopped while processing the recording.",
+            }
+        return json.loads(output)
+    finally:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+        await process.communicate()
+
+
+async def _download_and_transcribe_whisper(cl, msg) -> dict:
+    with _WhisperDownload() as audio:
+        await cl.download_media(msg, file=audio)
+        if not audio.tell():
+            return {"status": "error", "error": "Empty media download."}
+        return await _run_whisper(audio.getvalue())
 
 
 async def _transcribe_via_whisper(cl, msg) -> dict:
     """Local faster-whisper. The audio never leaves this machine."""
-    global _WHISPER_SEMAPHORE
     error = engine_config_error("whisper")
     if error:
         return {"status": "error", "error": error}
-
-    data, error = await _download_audio(cl, msg, None)
-    if error is not None:
-        return error
-
-    if _WHISPER_SEMAPHORE is None:
-        _WHISPER_SEMAPHORE = asyncio.Semaphore(1)
-    language = transcribe_language()
+    if (voice_duration(msg) or 0) > whisper_worker.MAX_AUDIO_SECONDS:
+        return {
+            "status": "error",
+            "error": f"Local Whisper accepts recordings up to {whisper_worker.MAX_AUDIO_SECONDS} seconds.",
+        }
+    file_size = getattr(getattr(msg, "file", None), "size", None)
+    if type(file_size) is int and file_size > whisper_worker.MAX_AUDIO_BYTES:
+        return _whisper_audio_too_large()
+    if not _WHISPER_SLOT.acquire(blocking=False):
+        return {"status": "error", "error": "Local Whisper is busy. Retry shortly."}
     try:
-        async with _WHISPER_SEMAPHORE:
-            text, lang = await asyncio.to_thread(
-                _run_whisper, bytes(data), _whisper_settings(), language
-            )
+        return await asyncio.wait_for(
+            _download_and_transcribe_whisper(cl, msg), timeout=whisper_worker.WALL_SECONDS
+        )
+    except whisper_worker.AudioLimitExceeded:
+        return _whisper_audio_too_large()
+    except asyncio.TimeoutError:
+        return {"status": "error", "error": "Local Whisper exceeded its processing deadline."}
     except Exception as e:
         return {"status": "error", "error": f"whisper failed: {e}"}
     finally:
-        del data
+        _WHISPER_SLOT.release()
 
-    if not text:
-        return {"status": "error", "error": "empty transcript from whisper"}
-    return {"status": "ok", "text": text, "lang": lang or language}
+
+def _whisper_audio_too_large() -> dict:
+    limit = whisper_worker.MAX_AUDIO_BYTES
+    return {
+        "status": "error",
+        "error": f"Recording exceeds the local Whisper limit of {limit:,} bytes.",
+    }
 
 
 async def transcribe(cl, entity, msg, engine: str) -> dict:
@@ -787,8 +850,14 @@ async def prefetch_transcripts(
             continue
         if getattr(msg, "message", None):
             continue  # already has text, nothing to fill
-        if get_cached_transcript(account_id, chat_id, msg.id, media_id) is not None:
-            continue
+        try:
+            if get_cached_transcript(account_id, chat_id, msg.id, media_id) is not None:
+                continue
+        except OSError as exc:
+            logger.warning(
+                "Skipping automatic transcription because its cache is unavailable: %s", exc
+            )
+            return
         duration = voice_duration(msg)
         if not budget.can_afford(duration):
             continue
@@ -836,7 +905,11 @@ def voice_attachment_info(
     media_id = voice_media_id(msg)
     if media_id is None:
         return info
-    cached = get_cached_transcript(account_id, chat_id, msg.id, media_id)
+    try:
+        cached = get_cached_transcript(account_id, chat_id, msg.id, media_id)
+    except OSError as exc:
+        logger.warning("Transcript cache unavailable: %s", exc)
+        return info
     if cached is not None:
         info["transcript"] = cached["text"]
         info["transcript_source"] = cached["source"]

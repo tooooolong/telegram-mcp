@@ -2913,6 +2913,7 @@ async def search_messages(
 
 SEARCH_GLOBAL_CHUNK = 100  # messages.searchGlobal returns at most 100 per request
 SEARCH_GLOBAL_MAX_EMPTY_CHUNKS = 3  # cleared megagroups can answer with MessageEmpty only
+SEARCH_GLOBAL_SCOPED_CHUNKS = 20
 
 
 class SearchOffset(NamedTuple):
@@ -2935,7 +2936,7 @@ _INVALID_SEARCH_CURSOR = "Error: Search cursor is invalid or expired. Restart th
 
 
 class SearchCursor(NamedTuple):
-    offset: SearchOffset
+    position: tuple[SearchOffset, int]
     account_id: int
     query_hash: bytes
     policy_hash: bytes
@@ -2966,7 +2967,7 @@ def _prune_search_cursors(now: float) -> None:
 
 
 def _create_search_cursor(
-    offset: SearchOffset, account_id: int, query_hash: bytes, policy_hash: bytes
+    position: tuple[SearchOffset, int], account_id: int, query_hash: bytes, policy_hash: bytes
 ) -> str:
     now = _search_cursor_clock()
     _prune_search_cursors(now)
@@ -2976,7 +2977,7 @@ def _create_search_cursor(
     while token in _search_cursors:
         token = secrets.token_urlsafe(32)
     _search_cursors[token] = SearchCursor(
-        offset, account_id, query_hash, policy_hash, now + SEARCH_CURSOR_TTL
+        position, account_id, query_hash, policy_hash, now + SEARCH_CURSOR_TTL
     )
     return token
 
@@ -3027,6 +3028,76 @@ async def _search_global_chunk(cl, query: str, offset: SearchOffset, limit: int)
     return found, SearchOffset(getattr(response, "next_rate", None) or 0, peer, last_id)
 
 
+async def _scoped_search_page(cl, query, position, skip, page_size):
+    offset, resume_index = position
+    has_blocked_usernames = any(isinstance(x, str) for x in get_blocked_chat_ids())
+    found = []
+    seen = set()
+    empty_chunks = 0
+
+    for _ in range(SEARCH_GLOBAL_SCOPED_CHUNKS):
+        chunk, next_offset = await _search_global_chunk(cl, query, offset, SEARCH_GLOBAL_CHUNK)
+        for index, (msg, chat) in enumerate(chunk):
+            chat_id = utils.get_peer_id(msg.peer_id)
+            key = (chat_id, msg.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            if index < resume_index:
+                continue
+            if chat is None and has_blocked_usernames:
+                try:
+                    chat = await resolve_entity(chat_id, cl)
+                except Exception:
+                    continue
+            if not is_chat_allowed(chat_id, chat) or not in_allowed_topics(
+                msg, get_allowed_topics(chat_id, chat)
+            ):
+                continue
+            if skip:
+                skip -= 1
+                continue
+            if len(found) == page_size:
+                # Resume in this batch at the first confirmed match we did not return.
+                return found, (offset, index)
+            found.append((msg, chat))
+
+        empty_chunks = 0 if chunk else empty_chunks + 1
+        if (
+            next_offset is None
+            or next_offset.key() == offset.key()
+            or empty_chunks >= SEARCH_GLOBAL_MAX_EMPTY_CHUNKS
+        ):
+            break
+        offset, resume_index = next_offset, 0
+
+    return found, None
+
+
+async def _unscoped_search_page(cl, query, offset, skip, page_size):
+    wanted = skip + page_size
+    found = []
+    seen = set()
+    empty_chunks = 0
+    while len(found) < wanted:
+        limit = min(SEARCH_GLOBAL_CHUNK, wanted - len(found))
+        chunk, next_offset = await _search_global_chunk(cl, query, offset, limit)
+        new = [(m, c) for m, c in chunk if (utils.get_peer_id(m.peer_id), m.id) not in seen]
+        seen.update((utils.get_peer_id(m.peer_id), m.id) for m, _ in new)
+        found.extend(new)
+        empty_chunks = 0 if chunk else empty_chunks + 1
+        # A short slice is not the end. Repeated or empty slices can be.
+        if (
+            next_offset is None
+            or next_offset.key() == offset.key()
+            or (chunk and not new)
+            or empty_chunks >= SEARCH_GLOBAL_MAX_EMPTY_CHUNKS
+        ):
+            return found[skip:wanted], None
+        offset = next_offset
+    return found[skip:wanted], (offset, 0)
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Search Global Messages",
@@ -3049,8 +3120,9 @@ async def search_global(
     as cursor (keep page=1) until exhausted is true. Cursors last up to 15
     minutes in this server process. If a cursor expires, start a new search.
     Use page for numbered pages.
-    page_size must be between 1 and 100. A page shortened by the chat allowlist is
-    not the end of the results; only exhausted is.
+    page_size must be between 1 and 100. With a chat policy, each call searches
+    a bounded window, with up to 20 Telegram batches, and exposes continuation
+    only when another visible match was found in that window.
 
     Records include links when present: {text, url} for text links and
     explicit URLs, {text, user_id} for mentions of users without a username.
@@ -3069,7 +3141,7 @@ async def search_global(
             raise ValueError("pass cursor with page=1")
         query_hash = hashlib.sha256(query.encode()).digest()
         policy_hash = _search_policy_hash()
-        offset = SearchOffset(0, types.InputPeerEmpty(), 0)
+        position = (SearchOffset(0, types.InputPeerEmpty(), 0), 0)
         state = None
         if cursor is not None:
             _prune_search_cursors(_search_cursor_clock())
@@ -3088,54 +3160,28 @@ async def search_global(
                 or _search_policy_hash() != policy_hash
             ):
                 return _INVALID_SEARCH_CURSOR
-            offset = state.offset
+            position = state.position
 
         # messages.searchGlobal pages with a (rate, peer, id) cursor, not an offset, and
         # message ids repeat across chats, so a page is reached by walking the cursor.
         skip = (page - 1) * page_size
-        wanted = skip + page_size
-        found: List[tuple] = []
-        seen = set()
-        empty_chunks = 0
-        exhausted = False
-        while len(found) < wanted:
-            limit = min(SEARCH_GLOBAL_CHUNK, wanted - len(found))
-            chunk, next_offset = await _search_global_chunk(cl, query, offset, limit)
-            new = [(m, c) for m, c in chunk if (utils.get_peer_id(m.peer_id), m.id) not in seen]
-            seen.update((utils.get_peer_id(m.peer_id), m.id) for m, _ in new)
-            found.extend(new)
-            empty_chunks = 0 if chunk else empty_chunks + 1
-            # A short slice is not the end (some chats hide messages); a repeat, or
-            # several slices of nothing but MessageEmpty in a row, is.
-            if (
-                next_offset is None
-                or next_offset.key() == offset.key()
-                or (chunk and not new)
-                or empty_chunks >= SEARCH_GLOBAL_MAX_EMPTY_CHUNKS
-            ):
-                exhausted = True
-                break
-            offset = next_offset
-        page_messages = found[skip:wanted]
+        if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
+            page_messages, next_position = await _scoped_search_page(
+                cl, query, position, skip, page_size
+            )
+        else:
+            page_messages, next_position = await _unscoped_search_page(
+                cl, query, position[0], skip, page_size
+            )
 
+        if _search_policy_hash() != policy_hash:
+            return _INVALID_SEARCH_CURSOR
         if not page_messages and cursor is None:
             return "No messages found for this page."
 
         records = []
-        has_blocked_usernames = any(isinstance(x, str) for x in get_blocked_chat_ids())
         for msg, chat in page_messages:
             chat_id = utils.get_peer_id(msg.peer_id)
-            if chat is None and has_blocked_usernames:
-                try:
-                    chat = await resolve_entity(chat_id, cl)
-                except Exception:
-                    pass
-            if (
-                is_chat_allowlist_enabled() or is_chat_blocklist_enabled()
-            ) and not is_chat_allowed(chat_id, chat):
-                continue
-            if not in_allowed_topics(msg, get_allowed_topics(chat_id, chat)):
-                continue
             chat_name = (
                 getattr(chat, "title", None) or getattr(chat, "first_name", "") or str(chat_id)
             )
@@ -3147,17 +3193,15 @@ async def search_global(
                 }
             )
 
-        if _search_policy_hash() != policy_hash:
-            return _INVALID_SEARCH_CURSOR
         return format_tool_result(
             records,
             metadata={
                 "next_cursor": (
                     None
-                    if exhausted
-                    else _create_search_cursor(offset, account_id, query_hash, policy_hash)
+                    if next_position is None
+                    else _create_search_cursor(next_position, account_id, query_hash, policy_hash)
                 ),
-                "exhausted": exhausted,
+                "exhausted": next_position is None,
             },
         )
     except Exception as e:

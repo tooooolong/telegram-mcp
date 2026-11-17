@@ -5,9 +5,10 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from starlette.testclient import TestClient
@@ -19,6 +20,7 @@ from telegram_mcp.transport.http import create_streamable_http_app
 BASE = "https://tg.example/acct"
 _prepare_upload = inspect.unwrap(media.prepare_upload)
 _download_media = inspect.unwrap(media.download_media)
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="Signed transfers require POSIX")
 
 
 @pytest.fixture
@@ -32,6 +34,11 @@ def root(tmp_path, monkeypatch):
 
 @pytest.fixture
 def client(monkeypatch):
+    @asynccontextmanager
+    async def test_lifespan():
+        yield
+
+    monkeypatch.setattr(runtime.mcp, "_service_lifespan", test_lifespan)
     monkeypatch.setenv("MCP_AUTH_TOKEN", "test-operator-token")
     with TestClient(
         create_streamable_http_app(runtime.mcp), base_url="http://localhost:8765"
@@ -47,15 +54,21 @@ def _local(url):
 @pytest.mark.asyncio
 async def test_upload_round_trip_lands_under_first_root(root, client):
     slot = json.loads(await _prepare_upload("../../etc/report 1.pdf"))
-    assert slot["file_path"].startswith(str(root / "uploads"))
+    target = Path(slot["file_path"])
+    assert target.is_relative_to(root / media_links.TRANSFER_SUBDIR / media_links.UPLOAD_SUBDIR)
     assert slot["file_path"].endswith(("/report 1.pdf", "\\report 1.pdf"))
 
     response = client.put(_local(slot["url"]), content=iter([b"%PDF-", b"bytes"]))
 
     assert response.status_code == 201
     assert response.json() == {"file_path": slot["file_path"], "size": 10}
-    assert Path(slot["file_path"]).read_bytes() == b"%PDF-bytes"
-    assert not Path(slot["file_path"] + ".part").exists()
+    assert target.read_bytes() == b"%PDF-bytes"
+    assert target.parent.stat().st_mode & 0o777 == 0o700
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert not target.with_name(media_links.UPLOAD_PARTIAL).exists()
+    assert await runtime._resolve_readable_file_path(
+        raw_path=str(target), ctx=None, tool_name="send_file"
+    ) == (target, None)
 
 
 @pytest.mark.asyncio
@@ -97,8 +110,10 @@ async def test_oversize_upload_is_refused(root, client, monkeypatch):
     monkeypatch.setitem(media.MAX_FILE_BYTES, "send_file", 4)
     slot = json.loads(await _prepare_upload("big.bin"))
     assert client.put(_local(slot["url"]), content=b"12345").status_code == 413
-    assert not Path(slot["file_path"]).exists()
-    assert not Path(slot["file_path"] + ".part").exists()
+    target = Path(slot["file_path"])
+    assert not target.exists()
+    assert not target.with_name(media_links.UPLOAD_PARTIAL).exists()
+    assert client.put(_local(slot["url"]), content=b"1234").status_code == 201
 
 
 @pytest.mark.asyncio
@@ -116,10 +131,13 @@ def test_download_url_serves_file_and_refuses_bad_links(root, client, tmp_path):
     file = root / "downloads" / "photo 1.jpg"
     file.write_bytes(b"jpeg")
     url = media_links.download_url(file, root)
-    assert url.startswith(BASE + "/media/downloads/photo%201.jpg?")
+    assert url.startswith(BASE + "/media/")
+    assert "/photo%201.jpg?" in url
 
     response = client.get(_local(url))
     assert response.status_code == 200 and response.content == b"jpeg"
+    partial = client.get(_local(url), headers={"Range": "bytes=0-1"})
+    assert partial.status_code == 206 and partial.content == b"jp"
 
     assert client.get(_local(url).replace("sig=", "sig=0")).status_code == 404
     outside = tmp_path / "secret.txt"
@@ -128,6 +146,28 @@ def test_download_url_serves_file_and_refuses_bad_links(root, client, tmp_path):
     future = int(time.time()) + 60
     sig = media_links._signature("media", "../secret.txt", future)
     assert media_links.resolve_download("../secret.txt", str(future), sig, root) is None
+
+
+@pytest.mark.asyncio
+async def test_download_links_keep_distinct_versions_of_one_output(root, client):
+    file = root / "report.txt"
+    file.write_bytes(b"first report")
+    first = media_links.download_url(file, root)
+    file.write_bytes(b"updated report")
+    second = media_links.download_url(file, root)
+
+    assert client.get(_local(first)).content == b"first report"
+    assert client.get(_local(second)).content == b"updated report"
+    relative = unquote(urlsplit(first).path.removeprefix("/acct/media/"))
+    snapshot = root / media_links.TRANSFER_SUBDIR / media_links.DOWNLOAD_SUBDIR / relative
+    readable, read_error = await runtime._resolve_readable_file_path(
+        raw_path=str(snapshot), ctx=None, tool_name="send_file"
+    )
+    writable, write_error = await runtime._resolve_writable_file_path(
+        raw_path=str(snapshot), default_filename="report.txt", ctx=None, tool_name="download_media"
+    )
+    assert readable is None and "signed download URL" in read_error
+    assert writable is None and "reserved" in write_error
 
 
 @pytest.mark.asyncio
@@ -158,48 +198,101 @@ async def test_download_media_reports_the_url(root, monkeypatch):
     result = await _download_media(123, 7, file_path=str(target))
 
     assert result.startswith(f"Media downloaded to {target}. From another machine, fetch it from ")
-    assert f"{BASE}/media/downloads/doc.pdf?" in result
+    assert f"{BASE}/media/" in result
+    assert "/doc.pdf?" in result
 
 
-def test_sweep_removes_only_stale_upload_slots(root):
-    uploads = root / "uploads"
-    for slot, age in (("old", 3 * media_links.URL_TTL_SECONDS), ("new", 0)):
-        (uploads / slot).mkdir(parents=True)
-        (uploads / slot / "f").write_bytes(b"x")
-        stamp = time.time() - age
-        os.utime(uploads / slot, (stamp, stamp))
-    media_links.sweep_expired_uploads(root)
-    assert [p.name for p in uploads.iterdir()] == ["new"]
+def _age_directory(path):
+    stamp = time.time() - 3 * media_links.URL_TTL_SECONDS
+    os.utime(path, (stamp, stamp))
+
+
+def test_sweep_removes_only_stale_managed_slots(root):
+    old = Path(media_links.upload_slot("old.txt", root)["file_path"])
+    new = Path(media_links.upload_slot("new.txt", root)["file_path"])
+    unrelated = old.parent.parent / ("0" * 32)
+    unrelated.mkdir(mode=0o700)
+    local = root / "uploads" / "my-project"
+    local.mkdir(parents=True)
+    for path in (old.parent, unrelated, local):
+        _age_directory(path)
+
+    media_links.upload_slot("next.txt", root)
+
+    assert not old.parent.exists()
+    assert new.parent.is_dir()
+    assert unrelated.is_dir()
+    assert local.is_dir()
+
+
+def test_transfer_slots_have_a_capacity_limit(root, monkeypatch):
+    monkeypatch.setattr(media_links, "MAX_TRANSFER_SLOTS", 1)
+    first = media_links.upload_slot("first.txt", root)
+    with pytest.raises(OSError, match="Too many active signed transfers"):
+        media_links.upload_slot("second.txt", root)
+
+    _age_directory(Path(first["file_path"]).parent)
+
+    assert media_links.upload_slot("second.txt", root) is not None
 
 
 def test_sweep_handles_os_errors_gracefully(root, monkeypatch, caplog):
-    """Permission errors during sweep are logged rather than raised unhandled."""
-    uploads = root / "uploads"
-    slot = uploads / "locked"
-    slot.mkdir(parents=True)
-    (slot / "f").write_bytes(b"x")
-    stamp = time.time() - 3 * media_links.URL_TTL_SECONDS
-    os.utime(slot, (stamp, stamp))
+    old = Path(media_links.upload_slot("old.txt", root)["file_path"])
+    _age_directory(old.parent)
 
     def fail_unlink(*args, **kwargs):
         raise PermissionError("Locked by another process")
 
     monkeypatch.setattr(Path, "unlink", fail_unlink)
     with caplog.at_level(logging.WARNING, logger="telegram_mcp.media_links"):
-        media_links.sweep_expired_uploads(root)
+        media_links.upload_slot("next.txt", root)
 
-    assert "Permission denied removing upload entry" in caplog.text
+    assert "Could not remove transfer slot" in caplog.text
 
 
-def test_sweep_cleans_subdirectories_inside_expired_slot(root):
-    """Expired slots with subdirectories are completely removed."""
-    uploads = root / "uploads"
-    slot = uploads / "nested"
-    sub = slot / "subdir"
-    sub.mkdir(parents=True)
-    (sub / "nested_file.bin").write_bytes(b"payload")
-    stamp = time.time() - 3 * media_links.URL_TTL_SECONDS
-    os.utime(slot, (stamp, stamp))
+def test_cleanup_does_not_walk_untracked_subdirectories(root):
+    old = Path(media_links.upload_slot("old.txt", root)["file_path"])
+    notes = old.parent / "notes"
+    notes.mkdir()
+    note = notes / "example.txt"
+    note.write_text("operator note", encoding="utf-8")
+    _age_directory(old.parent)
 
-    media_links.sweep_expired_uploads(root)
-    assert not slot.exists()
+    media_links.upload_slot("next.txt", root)
+
+    assert note.read_text(encoding="utf-8") == "operator note"
+
+
+@pytest.mark.asyncio
+async def test_transfer_storage_requires_an_owned_private_directory(root):
+    staging = root / media_links.TRANSFER_SUBDIR
+    staging.mkdir(mode=0o755)
+    staging.chmod(0o755)
+
+    response = await _prepare_upload("report.txt")
+
+    assert "Could not prepare a private upload slot" in response
+    assert list(staging.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_storage_refuses_an_alias_to_a_service_directory(root):
+    destination = root / "operator-files"
+    destination.mkdir(mode=0o700)
+    alias = root / media_links.TRANSFER_SUBDIR
+    alias.symlink_to(destination, target_is_directory=True)
+
+    response = await _prepare_upload("report.txt")
+
+    assert "Could not prepare a private upload slot" in response
+    assert list(destination.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_transfer_storage_disables_when_private_checks_are_unavailable(root, monkeypatch):
+    # Patch only the platform check rather than changing the host's pathlib implementation.
+    monkeypatch.setattr(
+        media_links, "os", SimpleNamespace(name="nt", fsencode=os.fsencode, getenv=os.getenv)
+    )
+
+    assert "Use a POSIX host" in await _prepare_upload("report.txt")

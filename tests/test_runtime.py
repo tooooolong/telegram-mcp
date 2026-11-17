@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -545,10 +546,12 @@ def test_apply_file_extension_overrides_rejects_malformed_extension(reset_extens
     assert "TELEGRAM_FILE_EXTENSIONS" in str(excinfo.value)
 
 
-def test_discover_accounts_supports_suffixed_and_default_sessions(monkeypatch):
+@pytest.mark.skipif(os.name != "posix", reason="Private SQLite file sessions require POSIX")
+def test_discover_accounts_supports_suffixed_and_default_sessions(monkeypatch, tmp_path):
     _clear_session_env(monkeypatch)
     monkeypatch.setenv("TELEGRAM_SESSION_STRING_WORK", "work-session")
-    monkeypatch.setenv("TELEGRAM_SESSION_NAME_PERSONAL", "personal.session")
+    session_path = tmp_path / "personal.session"
+    monkeypatch.setenv("TELEGRAM_SESSION_NAME_PERSONAL", str(session_path))
     monkeypatch.setenv("TELEGRAM_SESSION_STRING", "default-session")
     monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
     monkeypatch.setattr(runtime, "StringSession", lambda value: f"StringSession:{value}")
@@ -557,7 +560,8 @@ def test_discover_accounts_supports_suffixed_and_default_sessions(monkeypatch):
 
     assert sorted(accounts) == ["default", "personal", "work"]
     assert accounts["work"].args[0] == "StringSession:work-session"
-    assert accounts["personal"].args[0] == "personal.session"
+    assert accounts["personal"].args[0] == str(session_path.resolve())
+    assert session_path.stat().st_mode & 0o777 == 0o600
     assert accounts["default"].args[0] == "StringSession:default-session"
 
 
@@ -1903,11 +1907,13 @@ def test_resolve_session_path_resolves_in_subdirectory(tmp_path, monkeypatch):
     assert resolved == str(fake_root / "new_account")
 
 
+@pytest.mark.skipif(os.name != "posix", reason="Private SQLite file sessions require POSIX")
 def test_discover_accounts_resolves_session_name_against_project_root(tmp_path, monkeypatch):
     """Verify _discover_accounts resolves TELEGRAM_SESSION_NAME against project root."""
     fake_root = tmp_path / "project"
     fake_root.mkdir()
-    (fake_root / "app_session.session").touch()
+    session_path = fake_root / "app_session.session"
+    session_path.touch(mode=0o600)
 
     _clear_session_env(monkeypatch)
     monkeypatch.setenv("TELEGRAM_SESSION_NAME", "app_session")
@@ -1921,4 +1927,45 @@ def test_discover_accounts_resolves_session_name_against_project_root(tmp_path, 
 
     accounts = runtime._discover_accounts()
     assert "default" in accounts
-    assert accounts["default"].args[0] == str(fake_root / "app_session")
+    assert accounts["default"].args[0] == str(session_path.resolve())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Private SQLite file sessions require POSIX")
+@pytest.mark.parametrize("name", ["work.session", "work.session-wal"])
+def test_file_session_refuses_storage_with_non_private_modes(name, tmp_path):
+    session_path = tmp_path / "work.session"
+    session_path.touch(mode=0o600)
+    unprotected = tmp_path / name
+    unprotected.touch(mode=0o600)
+    unprotected.chmod(0o640)
+
+    with pytest.raises(SystemExit, match="Cannot open private Telegram session"):
+        runtime._file_session(str(session_path))
+
+
+def test_in_memory_session_does_not_need_a_file():
+    assert isinstance(runtime._file_session(":memory:"), runtime.MemorySession)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Private SQLite file sessions require POSIX")
+def test_file_session_requires_a_trusted_parent(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    path = shared / "work.session"
+
+    with pytest.raises(SystemExit, match="Cannot open private Telegram session"):
+        runtime._file_session(str(path))
+
+    assert not path.exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Requires Darwin ACL APIs")
+def test_file_session_rejects_extended_allow_even_in_owner_only_mode(tmp_path):
+    path = tmp_path / "work.session"
+    path.touch(mode=0o600)
+    subprocess.run(["chmod", "+a", "everyone allow read", str(path)], check=True)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+    with pytest.raises(SystemExit, match="Cannot open private Telegram session"):
+        runtime._file_session(str(path))

@@ -249,7 +249,7 @@ async def test_log_size_zero_records_nothing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_group_messages_stay_out_of_the_private_debounce_tools():
-    await events._on_new_incoming(_event(chat_id=-555))
+    await events._on_new_incoming(_event(chat_id=-555), account="default")
 
     assert events._pending_msgs == {}
 
@@ -265,7 +265,6 @@ def test_both_handlers_registered_per_client(monkeypatch):
     events.register_incoming_handlers()
 
     assert len(added) == 2
-    assert added[0][0] is events._on_new_incoming
     assert added[0][1].incoming is True
     assert added[1][1].incoming is None  # outgoing messages from other devices too
 
