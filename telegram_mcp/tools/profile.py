@@ -122,6 +122,8 @@ async def get_privacy_settings(account: Optional[str] = None) -> str:
             settings = await cl(
                 functions.account.GetPrivacyRequest(key=InputPrivacyKeyStatusTimestamp())
             )
+            if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
+                settings = _visible_privacy_rules(settings)
             return str(settings)
         except TypeError as e:
             if "TLObject was expected" in str(e):
@@ -133,6 +135,27 @@ async def get_privacy_settings(account: Optional[str] = None) -> str:
                 raise
     except Exception as e:
         return log_and_format_error("get_privacy_settings", e)
+
+
+def _visible_privacy_rules(settings):
+    users = [user for user in settings.users if is_chat_allowed(None, user)]
+    chats = [chat for chat in settings.chats if is_chat_allowed(None, chat)]
+    user_ids = {user.id for user in users}
+    # A rule uses bare IDs, so an ID shared with a hidden chat is ambiguous.
+    chat_ids = {chat.id for chat in chats} - {
+        chat.id for chat in settings.chats if not is_chat_allowed(None, chat)
+    }
+    rules = []
+    for rule in settings.rules:
+        if isinstance(rule, (types.PrivacyValueAllowUsers, types.PrivacyValueDisallowUsers)):
+            rule = type(rule)(users=[user_id for user_id in rule.users if user_id in user_ids])
+        elif isinstance(
+            rule,
+            (types.PrivacyValueAllowChatParticipants, types.PrivacyValueDisallowChatParticipants),
+        ):
+            rule = type(rule)(chats=[chat_id for chat_id in rule.chats if chat_id in chat_ids])
+        rules.append(rule)
+    return types.account.PrivacyRules(rules=rules, chats=chats, users=users)
 
 
 class _PrivacyRefusal(ValueError):
@@ -322,6 +345,13 @@ def _business_profile(full_user) -> dict:
     return profile
 
 
+async def _resolve_profile_subject(identifier: Union[int, str], client):
+    entity = await resolve_entity(identifier, client)
+    if err := await check_resolved_chat_access(identifier, entity, client):
+        raise ChatAccessDeniedError(err)
+    return entity
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Get Full User", openWorldHint=True, readOnlyHint=True)
 )
@@ -344,23 +374,27 @@ async def get_full_user(username: Union[int, str], account: Optional[str] = None
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        entity = await resolve_entity(username, cl)
+        entity = await _resolve_profile_subject(username, cl)
         full = await cl(functions.users.GetFullUserRequest(id=entity))
 
-        user = full.users[0] if full.users else None
+        user = next((user for user in full.users if user.id == entity.id), None)
         full_user = full.full_user
 
         personal_channel_id = getattr(full_user, "personal_channel_id", None)
         personal_channel = None
         if personal_channel_id:
+            channel = types.PeerChannel(personal_channel_id)
+            marked_channel_id = utils.get_peer_id(channel)
             try:
-                ch = await cl.get_entity(personal_channel_id)
-                ch_username = getattr(ch, "username", None)
-                personal_channel = (
-                    f"https://t.me/{ch_username}" if ch_username else str(personal_channel_id)
-                )
+                ch = await cl.get_entity(channel)
+                if get_marked_id(ch) == marked_channel_id and is_chat_allowed(None, ch):
+                    ch_username = getattr(ch, "username", None)
+                    personal_channel = (
+                        f"https://t.me/{ch_username}" if ch_username else str(personal_channel_id)
+                    )
             except Exception:
-                personal_channel = str(personal_channel_id)
+                if saved_alias_visible(marked_channel_id):
+                    personal_channel = str(personal_channel_id)
 
         # Birthday is exposed in UserFull for Premium users who set it and allow
         # contacts to see it. The `year` component is optional (often hidden).
@@ -421,7 +455,7 @@ async def get_bot_info(bot_username: str, account: Optional[str] = None) -> str:
     """
     try:
         cl = get_client(account)
-        entity = await resolve_entity(bot_username, cl)
+        entity = await _resolve_profile_subject(bot_username, cl)
         if not entity:
             return f"Bot with username {bot_username} not found."
 
@@ -519,7 +553,7 @@ async def get_user_photos(
     """
     try:
         cl = get_client(account)
-        user = await resolve_entity(user_id, cl)
+        user = await _resolve_profile_subject(user_id, cl)
         photos = await cl(
             functions.photos.GetUserPhotosRequest(user_id=user, offset=0, max_id=0, limit=limit)
         )
@@ -539,7 +573,7 @@ async def get_user_status(user_id: Union[int, str], account: Optional[str] = Non
     """
     try:
         cl = get_client(account)
-        user = await resolve_entity(user_id, cl)
+        user = await _resolve_profile_subject(user_id, cl)
         return str(user.status)
     except Exception as e:
         return log_and_format_error("get_user_status", e, user_id=user_id)

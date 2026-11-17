@@ -18,7 +18,7 @@ if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     except Exception:
         pass
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
@@ -40,12 +40,11 @@ from telethon import TelegramClient, functions, types, utils
 from telethon.errors import AuthKeyDuplicatedError, FloodWaitError, BotMethodInvalidError, RPCError
 from telethon.errors.rpcerrorlist import rpc_errors_dict
 from telethon.sessions import StringSession
+from telethon.tl.tlobject import TLObject
 from telethon.tl.types import (
     User,
     Chat,
-    ChatForbidden,
     Channel,
-    ChannelForbidden,
     ChatAdminRights,
     ChatBannedRights,
     ChannelParticipantsKicked,
@@ -116,11 +115,7 @@ def get_entity_type(entity: Any) -> str:
 
 def get_marked_id(entity: Any) -> int:
     """Return a Telethon-compatible marked ID for an entity."""
-    if isinstance(entity, (Channel, ChannelForbidden)):
-        return -1000000000000 - entity.id
-    if isinstance(entity, (Chat, ChatForbidden)):
-        return -entity.id
-    return entity.id
+    return utils.get_peer_id(entity) if isinstance(entity, TLObject) else entity.id
 
 
 def get_entity_filter_type(entity: Any) -> Optional[str]:
@@ -904,7 +899,7 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
-_chat_policy_targets: ContextVar = ContextVar("chat_policy_targets", default=())
+_chat_policy_targets: ContextVar = ContextVar("chat_policy_targets", default=((), None))
 _chat_policy_action: ContextVar = ContextVar("chat_policy_action", default=None)
 
 
@@ -1543,29 +1538,13 @@ def get_allowed_topics(
     """Forum topic IDs a chat is limited to by TELEGRAM_ALLOWED_CHAT_IDS.
 
     None means no topic limit: the chat is listed whole, or not listed at all (the
-    chat allowlist decides about that). The identifier and the entity are matched
-    like ``is_chat_allowed`` does, by marked ID and username; a chat that matches a
-    whole entry under one of them is allowed whole.
+    chat allowlist decides about that). Like ``is_chat_allowed``, a resolved entity
+    supplies the policy keys. A whole entry for that entity takes precedence.
     """
     by_chat, whole = _effective_allowed_topics()
     if not by_chat:
         return None
-    keys: set[Union[int, str]] = set()
-    if chat_identifier is not None and not isinstance(chat_identifier, bool):
-        if isinstance(chat_identifier, int):
-            keys.add(int(chat_identifier))
-        else:
-            key = _allowlist_chat_key(str(chat_identifier).strip())
-            if key is not None:
-                keys.add(key)
-    if entity is not None:
-        try:
-            keys.add(get_marked_id(entity))
-        except Exception:
-            pass
-        username = getattr(entity, "username", None)
-        if username:
-            keys.add(str(username).lstrip("@").lower())
+    keys = _chat_policy_keys(chat_identifier, entity)
     if keys & whole:
         return None
     limits = [by_chat[key] for key in keys if key in by_chat]
@@ -1581,89 +1560,115 @@ def is_chat_blocklist_enabled() -> bool:
     return bool(get_blocked_chat_ids())
 
 
+def chat_policy_uses_usernames() -> bool:
+    return any(
+        isinstance(key, str)
+        for key in (get_effective_allowed_chat_ids() or set()) | get_blocked_chat_ids()
+    )
+
+
+def _chat_policy_keys(chat_identifier: Any = None, entity: Any = None) -> set[Union[int, str]]:
+    if entity is None:
+        if isinstance(chat_identifier, bool) or not isinstance(chat_identifier, (int, str)):
+            return set()
+        key = _allowlist_chat_key(str(chat_identifier).strip())
+        return {key} if key is not None else set()
+
+    keys = set()
+    with suppress(TypeError, ValueError, AttributeError):
+        keys.add(get_marked_id(entity))
+    username = getattr(entity, "username", None)
+    if username:
+        keys.add(username.lower())
+    keys.update(
+        entry.username.lower()
+        for entry in getattr(entity, "usernames", None) or ()
+        if entry.active and entry.username
+    )
+    return keys
+
+
 def is_chat_blocked(chat_identifier: Any, entity: Any = None) -> bool:
     blocked = get_blocked_chat_ids()
-    if not blocked:
-        return False
-    if chat_identifier is not None and not isinstance(chat_identifier, bool):
-        ident = str(chat_identifier).strip()
-        key = int(ident) if _NUMERIC_CHAT_ID_RE.fullmatch(ident) else ident.lstrip("@").lower()
-        if key in blocked:
-            return True
-    if entity is not None:
-        try:
-            if get_marked_id(entity) in blocked:
-                return True
-        except Exception:
-            try:
-                if utils.get_peer_id(entity) in blocked:
-                    return True
-            except Exception:
-                pass
-        username = getattr(entity, "username", None)
-        if username and str(username).lstrip("@").lower() in blocked:
-            return True
-    return False
+    return bool(
+        blocked
+        and (
+            blocked & _chat_policy_keys(chat_identifier)
+            or blocked & _chat_policy_keys(entity=entity)
+        )
+    )
 
 
 def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
     """Check whether a chat is permitted by the active access policies.
 
-    Integer identifiers are compared as marked IDs (see
-    ``_parse_allowed_chat_ids``); an entity is compared by its marked ID and
-    username only. Its bare ``id`` is never used: the same number is a
-    different chat in the user, basic-group and channel namespaces.
-
-    The blocklist filters reads, while the allowlist applies to all operations.
+    Once resolved, only the entity's marked ID and current usernames grant access.
+    The requested identifier may still deny access under the blocklist.
     """
     if _chat_policy_action.get() is None and is_chat_blocked(chat_identifier, entity):
         return False
     allowed = get_effective_allowed_chat_ids()
-    if allowed is None:
-        return True
-
-    if chat_identifier is not None and not isinstance(chat_identifier, bool):
-        if isinstance(chat_identifier, int):
-            if chat_identifier in allowed:
-                return True
-        elif isinstance(chat_identifier, str):
-            ident = chat_identifier.strip()
-            if _NUMERIC_CHAT_ID_RE.fullmatch(ident):
-                if int(ident) in allowed:
-                    return True
-            else:
-                clean = ident.lstrip("@").strip().lower()
-                if clean and clean in allowed:
-                    return True
-
-    if entity is not None:
-        try:
-            marked_id = get_marked_id(entity)
-            if marked_id in allowed:
-                return True
-        except Exception:
-            pass
-
-        username = getattr(entity, "username", None)
-        if username and str(username).lower() in allowed:
-            return True
-
-    return False
+    return allowed is None or bool(allowed & _chat_policy_keys(chat_identifier, entity))
 
 
-def check_chat_access(chat_identifier: Any, entity: Any = None) -> Optional[str]:
+def check_chat_access(
+    chat_identifier: Any, entity: Any = None, *, topic_restricted_tool: Optional[str] = None
+) -> Optional[str]:
     """Return an error message if chat access is restricted, or None if allowed."""
+    display = alias_wording(chat_identifier) or chat_identifier
     if _chat_policy_action.get() is None and is_chat_blocked(chat_identifier, entity):
         return (
-            f"Access to chat '{chat_identifier}' is restricted by privacy policy "
+            f"Access to chat '{display}' is restricted by privacy policy "
             "(TELEGRAM_BLOCKED_CHAT_IDS)."
         )
     if not is_chat_allowed(chat_identifier, entity):
         return (
-            f"Access to chat '{chat_identifier}' is restricted by privacy policy "
+            f"Access to chat '{display}' is restricted by privacy policy "
             "(TELEGRAM_ALLOWED_CHAT_IDS)."
         )
+    if topic_restricted_tool and (topics := get_allowed_topics(chat_identifier, entity)):
+        return topic_limited_tool_message(display, topics, topic_restricted_tool)
     return None
+
+
+def _ensure_requested_peer(chat_identifier: Any, entity: Any) -> None:
+    if isinstance(chat_identifier, TLObject):
+        requested = _chat_policy_keys(entity=chat_identifier)
+    else:
+        requested = _chat_policy_keys(chat_identifier)
+    if any(isinstance(key, int) for key in requested) and not requested & _chat_policy_keys(
+        entity=entity
+    ):
+        raise ChatAccessDeniedError(
+            "The requested ID resolved to a different chat (TELEGRAM_ALLOWED_CHAT_IDS)."
+        )
+
+
+async def _chat_policy_entity(entity: Any, client) -> Any:
+    """Get username policy keys from the same peer when resolving an InputPeer."""
+    if getattr(entity, "SUBCLASS_OF_ID", None) != types.InputPeerUser.SUBCLASS_OF_ID:
+        return entity
+    if not isinstance(entity, types.InputPeerSelf) and not chat_policy_uses_usernames():
+        return entity
+    resolved = await client.get_entity(entity)
+    if not isinstance(entity, types.InputPeerSelf) and utils.get_peer_id(entity) != get_marked_id(
+        resolved
+    ):
+        raise ValueError("Resolved metadata belongs to a different Telegram peer.")
+    return resolved
+
+
+async def check_resolved_chat_access(
+    chat_identifier: Any, entity: Any, client, *, topic_restricted_tool: Optional[str] = None
+) -> Optional[str]:
+    if not (is_chat_allowlist_enabled() or is_chat_blocklist_enabled()):
+        return None
+    policy_entity = await _chat_policy_entity(entity, client)
+    if is_chat_allowlist_enabled():
+        _ensure_requested_peer(chat_identifier, policy_entity)
+    return check_chat_access(
+        chat_identifier, policy_entity, topic_restricted_tool=topic_restricted_tool
+    )
 
 
 def _topic_ids_text(topics: Iterable[int]) -> str:
@@ -1786,9 +1791,7 @@ def log_and_format_error(
     if isinstance(error, AliasNeedsUser):
         return error.payload
     if isinstance(error, ChatAccessDeniedError) and not user_message:
-        user_message = (
-            "Access to chat is restricted by privacy policy (TELEGRAM_BLOCKED_CHAT_IDS)."
-        )
+        user_message = str(error)
 
     # Generate a consistent error code
     if isinstance(prefix, str) and prefix == "VALIDATION-001":
@@ -1880,7 +1883,9 @@ def validate_id(*param_names_to_validate, raise_errors=False, topic_aware=False)
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
-            if is_chat_blocklist_enabled() and args:
+            allowlist = get_effective_allowed_chat_ids()
+            blocklist = is_chat_blocklist_enabled()
+            if (allowlist is not None or blocklist) and args:
                 signature = inspect.signature(func)
                 bound = signature.bind_partial(*args, **kwargs)
                 if all(
@@ -1979,9 +1984,11 @@ def validate_id(*param_names_to_validate, raise_errors=False, topic_aware=False)
                     for item in items:
                         if _chat_policy_action.get() is None and is_chat_blocked(item):
                             err = check_chat_access(item)
-                        elif is_chat_allowlist_enabled() and not is_chat_allowed(item):
+                        elif allowlist is not None and not is_chat_allowed(item):
                             entity = None
-                            if isinstance(item, str):
+                            if isinstance(item, str) or any(
+                                isinstance(key, str) for key in allowlist
+                            ):
                                 try:
                                     cl = get_client(kwargs.get("account"))
                                     if cl:
@@ -2006,7 +2013,7 @@ def validate_id(*param_names_to_validate, raise_errors=False, topic_aware=False)
                                 )
                             )
 
-            if not is_chat_blocklist_enabled():
+            if allowlist is None and not blocklist:
                 return await func(*args, **kwargs)
 
             targets = []
@@ -2017,7 +2024,9 @@ def validate_id(*param_names_to_validate, raise_errors=False, topic_aware=False)
             redaction = _chat_policy_action.get()
             if redaction is not None:
                 redaction[0] = redaction[0] or any(is_chat_blocked(target) for target in targets)
-            token = _chat_policy_targets.set(tuple(targets))
+            token = _chat_policy_targets.set(
+                (tuple(targets), None if topic_aware else func.__name__)
+            )
             try:
                 return await func(*args, **kwargs)
             finally:
@@ -2595,8 +2604,10 @@ def alias_ask_payload(reference: str, kind: str = "unknown", stored_id: Optional
     Server-authored text interpolating only the caller's own reference; any
     Telegram-supplied name stays quarantined inside the candidates list.
     """
-    matches = match_aliases(reference)
-    known = sorted(load_aliases())[:20]
+    matches = visible_alias_matches(reference)
+    known = sorted(
+        alias for alias, record in load_aliases().items() if saved_alias_visible(record["id"])
+    )[:20]
     candidates = [
         {"alias": alias, "id": record["id"], "name": record.get("name")}
         for alias, record in matches[:5]
@@ -2605,6 +2616,8 @@ def alias_ask_payload(reference: str, kind: str = "unknown", stored_id: Optional
         # It resembled something saved: one lookalike is a yes/no confirmation,
         # several are a genuine choice.
         kind = "ambiguous" if len({c["id"] for c in candidates}) > 1 else "confirm"
+    if kind == "stale" and not saved_alias_visible(stored_id):
+        kind = "unknown"
     if kind == "stale":
         instruction = (
             f"Nothing was sent. The saved contact for «{reference}» (id {stored_id}) no longer "
@@ -2648,6 +2661,24 @@ def alias_ask_payload(reference: str, kind: str = "unknown", stored_id: Optional
             ),
         },
         ensure_ascii=False,
+    )
+
+
+def visible_alias_matches(query: str) -> List[tuple]:
+    return [
+        (alias, record)
+        for alias, record in match_aliases(query)
+        if saved_alias_visible(record["id"])
+    ]
+
+
+def saved_alias_visible(chat_id: Optional[int]) -> bool:
+    """A stored alias only proves a marked ID, without a current username."""
+    return (
+        chat_id is not None
+        and not any(isinstance(key, str) for key in get_blocked_chat_ids())
+        and not is_chat_blocked(chat_id)
+        and is_chat_allowed(chat_id)
     )
 
 
@@ -2743,19 +2774,31 @@ async def _resolve(getter: str, identifier: Union[int, str], client, label: str)
     try:
         # An id that came from a saved alias is exact; guessing marked variants of
         # it could deliver to a completely unrelated chat.
-        from_alias = identifier is not original
+        from_alias = isinstance(original, AliasID) or identifier is not original
+        allowlist = get_effective_allowed_chat_ids()
+        targets, topic_restricted_tool = _chat_policy_targets.get()
+        scoped = identifier in targets
         entity = await _resolve_with_retries(
-            getter, identifier, client, label, try_marked=not from_alias
+            getter, identifier, client, label, try_marked=not from_alias and allowlist is None
         )
-        targets = _chat_policy_targets.get()
-        if (
-            targets
-            and any(identifier == apply_alias(target) for target in targets)
-            and is_chat_blocked(identifier, entity)
-        ):
+        policy_entity = entity
+        if scoped or (allowlist is not None and isinstance(entity, types.InputPeerSelf)):
+            policy_entity = await _chat_policy_entity(entity, client)
+        if allowlist is not None:
+            _ensure_requested_peer(identifier, policy_entity)
+        if not scoped:
+            return entity
+
+        if allowlist is not None:
+            err = check_chat_access(
+                original, policy_entity, topic_restricted_tool=topic_restricted_tool
+            )
+            if err is not None:
+                raise ChatAccessDeniedError(err)
+        if is_chat_blocked(identifier, policy_entity):
             redaction = _chat_policy_action.get()
             if redaction is None:
-                raise ChatAccessDeniedError(check_chat_access(identifier, entity))
+                raise ChatAccessDeniedError(check_chat_access(original, policy_entity))
             redaction[0] = True
         return entity
     except (ValueError, *_PEER_ERRORS) as error:

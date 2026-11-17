@@ -2669,7 +2669,7 @@ async def send_typing(
                 chat_id=chat_id,
             )
 
-        peer = await resolve_input_entity(chat_id, cl)
+        peer = await resolve_input_entity(entity, cl)
         typing = functions.messages.SetTypingRequest(
             peer=peer, action=types.SendMessageTypingAction(), top_msg_id=topic_id
         )

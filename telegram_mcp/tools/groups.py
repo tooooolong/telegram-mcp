@@ -337,7 +337,7 @@ async def get_participants(
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        if is_chat_blocklist_enabled():
+        if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
             chat_id = await resolve_entity(chat_id, cl)
 
         # Skip the prefix without retaining it. Basic groups can ignore limit,
@@ -1832,7 +1832,7 @@ async def get_recent_actions(chat_id: Union[int, str], account: Optional[str] = 
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        if is_chat_blocklist_enabled():
+        if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
             chat_id = await resolve_entity(chat_id, cl)
         result = await cl(
             functions.channels.GetAdminLogRequest(

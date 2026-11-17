@@ -21,7 +21,7 @@ from telegram_mcp.runtime import (
     is_chat_allowlist_enabled,
     validate_id,
 )
-from telegram_mcp.tools import chats, contacts, folders, groups, messages
+from telegram_mcp.tools import chats, contacts, folders, groups, messages, profile
 
 
 @pytest.fixture(autouse=True)
@@ -247,6 +247,180 @@ def test_allowed_user_does_not_allow_chats_with_same_bare_id(monkeypatch):
     assert is_chat_allowed(-4242, _typed_basic_group(4242)) is False
 
 
+def test_resolved_peer_controls_allowlist_and_topic_scope(monkeypatch):
+    group = _typed_channel(4242, username="team")
+    group_id = get_marked_id(group)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", f"101,{group_id}:7")
+
+    assert is_chat_allowed(101, User(id=101))
+    assert not is_chat_allowed(101, User(id=202))
+    assert not is_chat_allowed(101, types.ChatEmpty(101))
+    assert not is_chat_allowed(101, types.CommunityForbidden(101, "Private"))
+    assert is_chat_allowed("@team", group)
+    assert runtime.get_allowed_topics(101, group) == {7}
+
+
+@pytest.mark.asyncio
+async def test_get_history_authorizes_the_peer_used_to_read(monkeypatch):
+    visible = User(id=101)
+    another = User(id=202)
+
+    class HistoryClient:
+        def __init__(self):
+            self.entity = visible
+            self.read_peers = []
+
+        async def get_entity(self, identifier):
+            return self.entity
+
+        async def get_messages(self, entity, *, limit):
+            self.read_peers.append(entity)
+            return []
+
+    client = HistoryClient()
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "101,202")
+    monkeypatch.setattr(messages, "get_client", lambda account=None: client)
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+
+    assert json.loads(await messages.get_history(chat_id=101))["results"] == []
+    client.entity = another
+    assert "TELEGRAM_ALLOWED_CHAT_IDS" in await messages.get_history(chat_id=101)
+    assert client.read_peers == [visible]
+
+
+@pytest.mark.asyncio
+async def test_input_peer_authorization_uses_current_username(monkeypatch):
+    user = User(
+        id=101,
+        username="primary_name",
+        usernames=[types.Username(username="shared_name", active=True)],
+    )
+    peer = types.InputPeerUser(101, 1)
+
+    class PeerClient:
+        async def get_input_entity(self, identifier):
+            return peer
+
+        async def get_entity(self, selected_peer):
+            assert selected_peer is peer
+            return user
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "@shared_name")
+    monkeypatch.setattr(runtime, "ensure_connected", _connected)
+
+    @validate_id("chat_id")
+    async def tool(chat_id: str):
+        return await runtime.resolve_input_entity(chat_id, PeerClient())
+
+    assert await tool(chat_id="@shared_name") is peer
+    user.usernames[0].active = False
+    with pytest.raises(ChatAccessDeniedError, match="TELEGRAM_ALLOWED_CHAT_IDS"):
+        await tool(chat_id="@shared_name")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", [contacts.export_contacts, contacts.get_blocked_users])
+async def test_contact_exports_use_the_resolved_user_policy(monkeypatch, tool):
+    visible = User(id=101, first_name="Visible", username="shared", phone="10001")
+    hidden = User(id=202, first_name="Hidden", phone="10002")
+    blocked = User(id=303, first_name="Excluded", phone="10003")
+
+    class ContactClient:
+        async def __call__(self, request):
+            return SimpleNamespace(users=[visible, hidden, blocked])
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "@shared,303")
+    monkeypatch.setenv("TELEGRAM_BLOCKED_CHAT_IDS", "303")
+    monkeypatch.setattr(contacts, "get_client", lambda account=None: ContactClient())
+    monkeypatch.setattr(contacts, "ensure_connected", _connected)
+
+    assert json.loads(await tool()) == [runtime.format_entity(visible)]
+
+
+@pytest.mark.asyncio
+async def test_profile_lookup_preserves_authorized_status_only(monkeypatch):
+    async def resolve(identifier, client):
+        return User(id=identifier, status=types.UserStatusRecently())
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "101")
+    monkeypatch.setattr(profile, "resolve_entity", resolve)
+
+    assert "UserStatusRecently" in await profile.get_user_status(101)
+    assert "TELEGRAM_ALLOWED_CHAT_IDS" in await profile.get_user_status(202)
+
+
+@pytest.mark.asyncio
+async def test_privacy_snapshot_filters_entities_and_rule_members(monkeypatch):
+    visible = User(id=101, first_name="Visible")
+    hidden = User(id=202, first_name="Hidden")
+    team = _typed_basic_group(10)
+    other_team = _typed_basic_group(20, "Hidden Team")
+
+    class ProfileClient:
+        async def __call__(self, request):
+            return types.account.PrivacyRules(
+                rules=[
+                    types.PrivacyValueAllowUsers(users=[101, 202]),
+                    types.PrivacyValueDisallowChatParticipants(chats=[10, 20]),
+                    types.PrivacyValueAllowContacts(),
+                ],
+                users=[visible, hidden],
+                chats=[team, other_team],
+            )
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "101,-10")
+    monkeypatch.setattr(profile, "get_client", lambda account=None: ProfileClient())
+    monkeypatch.setattr(profile, "ensure_connected", _connected)
+
+    result = await profile.get_privacy_settings()
+    assert result == str(
+        types.account.PrivacyRules(
+            rules=[
+                types.PrivacyValueAllowUsers(users=[101]),
+                types.PrivacyValueDisallowChatParticipants(chats=[10]),
+                types.PrivacyValueAllowContacts(),
+            ],
+            users=[visible],
+            chats=[team],
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_alias_lists_and_help_show_only_visible_contacts(monkeypatch):
+    aliases = {
+        "first contact": {"id": 101, "name": "Visible"},
+        "second contact": {"id": 202, "name": "Hidden"},
+    }
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "101")
+    monkeypatch.setattr(runtime, "load_aliases", lambda: aliases)
+    monkeypatch.setattr(contacts, "load_aliases", lambda: aliases)
+
+    listing = json.loads(await contacts.list_contact_aliases())
+    assert listing["results"] == [{"id": 101, "name": "Visible", "aliases": ["first contact"]}]
+    help_result = json.loads(runtime.alias_ask_payload("second contact"))
+    assert help_result["known_aliases"] == ["first contact"]
+    assert help_result["candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_alias_save_denial_uses_the_supplied_name(monkeypatch):
+    async def resolve(identifier, client):
+        return User(id=int(identifier), first_name="Hidden")
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "101")
+    monkeypatch.setattr(runtime, "load_aliases", lambda: {"saved contact": {"id": 202}})
+    monkeypatch.setattr(contacts, "resolve_entity", resolve)
+    monkeypatch.setattr(
+        contacts, "update_aliases", lambda _: pytest.fail("Unexpected alias write")
+    )
+
+    result = await contacts.set_contact_alias(alias="another nickname", chat_id="saved contact")
+    assert "TELEGRAM_ALLOWED_CHAT_IDS" in result
+    assert "saved contact" in result
+    assert "202" not in result and "Hidden" not in result
+
+
 def test_allowed_basic_group_does_not_allow_user_with_same_bare_id(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-777")
 
@@ -336,8 +510,9 @@ async def test_validate_id_blocks_batch_from_and_to_chats(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_list_chats_filters_out_unallowed_chats(monkeypatch):
-    allowed_entity = SimpleNamespace(id=111, title="Public Dev", username="dev_chat")
-    secret_entity = SimpleNamespace(id=222, title="Private CEO", username="ceo_chat")
+    allowed_entity = _typed_channel(111, title="Public Dev", username="dev_chat")
+    secret_entity = _typed_channel(222, title="Private CEO", username="ceo_chat")
+    allowed_id = get_marked_id(allowed_entity)
 
     d1 = FakeDialog(allowed_entity, unread_count=2)
     d2 = FakeDialog(secret_entity, unread_count=5)
@@ -348,21 +523,17 @@ async def test_list_chats_filters_out_unallowed_chats(monkeypatch):
 
     monkeypatch.setattr(chats, "get_client", lambda account=None: client)
     monkeypatch.setattr(chats, "ensure_connected", _fake_connected)
-    monkeypatch.setattr(chats, "get_marked_id", lambda e: -100111 if e.id == 111 else -100222)
     monkeypatch.setattr(chats, "get_entity_type", lambda e: "Channel")
     monkeypatch.setattr(chats, "get_entity_filter_type", lambda e: "channel")
 
-    # When allowlist is set to only allowed_entity (-100111)
-    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "-100111")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", str(allowed_id))
 
     result = await chats.list_chats(account=None)
     parsed = json.loads(result).get("results", [])
 
     assert len(parsed) == 1
-    assert parsed[0]["chat_id"] == -100111
+    assert parsed[0]["chat_id"] == allowed_id
     assert parsed[0]["title"] == "Public Dev"
-    # Secret chat (-100222) must never be present
-    assert not any(c.get("chat_id") == -100222 for c in parsed)
 
 
 @pytest.mark.asyncio
@@ -679,8 +850,12 @@ async def test_group_admin_tool_lets_an_allowlisted_group_through(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allowlist", ["", "101"], ids=["no-allowlist", "allowlist"])
-async def test_create_folder_accepts_saved_messages(monkeypatch, allowlist):
+@pytest.mark.parametrize(
+    ("allowlist", "allowed"),
+    [("", True), ("101", True), ("202", False)],
+    ids=["no-allowlist", "allowed-self", "unlisted-self"],
+)
+async def test_create_folder_applies_saved_messages_policy(monkeypatch, allowlist, allowed):
     from telethon.tl.types import InputPeerSelf
 
     class FolderClient:
@@ -690,6 +865,10 @@ async def test_create_folder_accepts_saved_messages(monkeypatch, allowlist):
         async def __call__(self, request):
             self.requests.append(request)
             return SimpleNamespace(filters=[])
+
+        async def get_entity(self, peer):
+            assert isinstance(peer, InputPeerSelf)
+            return User(id=101, is_self=True)
 
     async def fake_resolve_input(chat_id, cl=None):
         return InputPeerSelf()
@@ -704,10 +883,11 @@ async def test_create_folder_accepts_saved_messages(monkeypatch, allowlist):
 
     res = await folders.create_folder(title="Notes", chat_ids=["me"], account=None)
 
-    assert "restricted by privacy policy" not in res
     created = [r for r in client.requests if type(r).__name__ == "UpdateDialogFilterRequest"]
-    assert len(created) == 1
-    assert isinstance(created[0].filter.include_peers[0], InputPeerSelf)
+    assert ("restricted by privacy policy" not in res) is allowed
+    assert len(created) == int(allowed)
+    if allowed:
+        assert isinstance(created[0].filter.include_peers[0], InputPeerSelf)
 
 
 @pytest.mark.asyncio

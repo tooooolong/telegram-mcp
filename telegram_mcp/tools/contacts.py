@@ -9,6 +9,20 @@ from telethon.errors import PhoneNotOccupiedError, PhoneNumberInvalidError
 from telegram_mcp.resolve_phone_limit import ResolvePhoneLimiter
 
 
+async def _known_contact_visible(chat_id: int, client, entity=None) -> bool:
+    if entity is None:
+        if saved_alias_visible(chat_id):
+            return True
+        if not chat_policy_uses_usernames():
+            return False
+        bare_id, peer_type = utils.resolve_id(chat_id)
+        try:
+            entity = await resolve_entity(peer_type(bare_id), client)
+        except (ValueError, *_PEER_ERRORS):
+            return False
+    return get_marked_id(entity) == chat_id and is_chat_allowed(chat_id, entity)
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="List Contacts", openWorldHint=True, readOnlyHint=True)
 )
@@ -83,15 +97,9 @@ async def search_contacts(query: str, account: Optional[str] = None) -> str:
         if not users and not alias_records:
             return f"No contacts found matching '{query}'."
         records = []
-        has_blocked_usernames = any(isinstance(item, str) for item in get_blocked_chat_ids())
+        users_by_id = {user.id: user for user in users}
         for record in alias_records:
-            entity = None
-            if has_blocked_usernames:
-                try:
-                    entity = await resolve_entity(record["id"], cl)
-                except Exception:
-                    pass
-            if is_chat_allowed(record["id"], entity):
+            if await _known_contact_visible(record["id"], cl, users_by_id.get(record["id"])):
                 records.append(record)
         for user in users:
             if not is_chat_allowed(get_marked_id(user), user):
@@ -124,20 +132,12 @@ async def get_contact_ids(account: Optional[str] = None) -> str:
     try:
         cl = get_client(account)
         await ensure_connected(cl)
-        result = await cl(functions.contacts.GetContactIDsRequest(hash=0))
-        if not result:
-            return "No contact IDs found."
-        visible = []
-        has_blocked_usernames = any(isinstance(item, str) for item in get_blocked_chat_ids())
-        for cid in result:
-            entity = None
-            if has_blocked_usernames:
-                try:
-                    entity = await resolve_entity(cid, cl)
-                except Exception:
-                    pass
-            if is_chat_allowed(cid, entity):
-                visible.append(str(cid))
+        if chat_policy_uses_usernames():
+            result = await cl(functions.contacts.GetContactsRequest(hash=0))
+            visible = [str(user.id) for user in result.users if is_chat_allowed(None, user)]
+        else:
+            ids = await cl(functions.contacts.GetContactIDsRequest(hash=0))
+            visible = [str(cid) for cid in (ids or ()) if is_chat_allowed(cid)]
         return "Contact IDs: " + ", ".join(visible) if visible else "No contact IDs found."
     except Exception as e:
         return log_and_format_error("get_contact_ids", e)
@@ -672,7 +672,11 @@ async def export_contacts(account: Optional[str] = None) -> str:
         await ensure_connected(cl)
         result = await cl(functions.contacts.GetContactsRequest(hash=0))
         users = result.users
-        return json.dumps([format_entity(u) for u in users], indent=2, ensure_ascii=False)
+        return json.dumps(
+            [format_entity(user) for user in users if is_chat_allowed(None, user)],
+            indent=2,
+            ensure_ascii=False,
+        )
     except Exception as e:
         return log_and_format_error("export_contacts", e)
 
@@ -689,7 +693,11 @@ async def get_blocked_users(account: Optional[str] = None) -> str:
         cl = get_client(account)
         await ensure_connected(cl)
         result = await cl(functions.contacts.GetBlockedRequest(offset=0, limit=100))
-        return json.dumps([format_entity(u) for u in result.users], indent=2, ensure_ascii=False)
+        return json.dumps(
+            [format_entity(user) for user in result.users if is_chat_allowed(None, user)],
+            indent=2,
+            ensure_ascii=False,
+        )
     except Exception as e:
         return log_and_format_error("get_blocked_users", e)
 
@@ -800,10 +808,11 @@ async def set_contact_alias(
                         ),
                         "candidates": [
                             {"alias": a, "id": r["id"], "name": r.get("name")}
-                            for a, r in match_aliases(chat_id)[:5]
+                            for a, r in visible_alias_matches(chat_id)[:5]
                         ],
                     }
                 )
+            target = AliasID(target, chat_id)
         else:
             target = chat_id
 
@@ -833,6 +842,14 @@ async def set_contact_alias(
         def _store(aliases):
             existing = aliases.get(key)
             if existing and existing["id"] != marked_id and not replace:
+                if not saved_alias_visible(existing["id"]):
+                    return format_tool_result(
+                        {
+                            "saved": False,
+                            "reason": "alias_already_used",
+                            "detail": "Confirm with the user before replacing this alias.",
+                        }
+                    )
                 return format_tool_result(
                     {
                         "saved": False,
@@ -887,10 +904,17 @@ async def list_contact_aliases(account: Optional[str] = None) -> str:
         aliases = load_aliases()
         if not aliases:
             return "No aliases saved."
+        cl = get_client(account)
         by_contact: Dict[int, Dict[str, Any]] = {}
+        visibility: Dict[int, bool] = {}
         for key, record in sorted(aliases.items()):
+            chat_id = record["id"]
+            if chat_id not in visibility:
+                visibility[chat_id] = await _known_contact_visible(chat_id, cl)
+            if not visibility[chat_id]:
+                continue
             row = by_contact.setdefault(
-                record["id"], {"id": record["id"], "name": record.get("name"), "aliases": []}
+                chat_id, {"id": chat_id, "name": record.get("name"), "aliases": []}
             )
             row["aliases"].append(key)
         return format_tool_result(list(by_contact.values()))
